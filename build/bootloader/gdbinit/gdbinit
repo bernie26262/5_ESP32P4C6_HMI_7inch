@@ -1,0 +1,2 @@
+source C:/esp/5_ESP32P4C6_HMI_7inch/build/bootloader/gdbinit/symbols
+source C:/esp/5_ESP32P4C6_HMI_7inch/build/bootloader/gdbinit/connect
