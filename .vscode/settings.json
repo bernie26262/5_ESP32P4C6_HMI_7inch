@@ -1,0 +1,17 @@
+{
+  "idf.currentSetup": "C:\\Espressif\\v5.3.5\\esp-idf",
+  "terminal.integrated.defaultProfile.windows": "ESP-IDF PowerShell",
+  "terminal.integrated.profiles.windows": {
+    "ESP-IDF PowerShell": {
+      "source": "PowerShell",
+      "args": [
+        "-NoExit",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\idf_env.ps1"
+      ]
+    }
+  },
+  "idf.flashType": "UART"
+}
