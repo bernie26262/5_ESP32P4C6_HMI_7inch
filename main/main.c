@@ -170,6 +170,11 @@ static bool g_pending_m1_retry = false;
 static bool g_pending_m2_retry = false;
 
 static volatile bool g_ui_dirty = false;
+static hmi_state_t g_last_rendered_state;
+static bool g_last_rendered_valid = false;
+static bool g_last_overlay_visible = false;
+static uint32_t g_power_led_bg_cache = 0xFFFFFFFFu;
+static uint32_t g_auto_led_bg_cache = 0xFFFFFFFFu;
 
 static const cJSON *json_get_path(const cJSON *root, const char *a, const char *b)
 {
@@ -741,6 +746,43 @@ static void ui_label_style(lv_obj_t *label, const lv_font_t *font, uint32_t colo
     lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
 }
 
+static bool ui_label_set_text_if_changed(lv_obj_t *label, const char *text)
+{
+    if (!label) return false;
+    if (!text) text = "";
+
+    const char *old = lv_label_get_text(label);
+    if (old && strcmp(old, text) == 0) {
+        return false;
+    }
+
+    lv_label_set_text(label, text);
+    return true;
+}
+
+static void ui_obj_set_hidden_if_changed(lv_obj_t *obj, bool hidden)
+{
+    if (!obj) return;
+
+    const bool is_hidden = lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    if (is_hidden == hidden) {
+        return;
+    }
+
+    if (hidden) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+}
+
+static bool ui_obj_set_bg_color_if_changed(lv_obj_t *obj, uint32_t *cache, uint32_t color)
+{
+    if (!obj || !cache) return false;
+    if (*cache == color) return false;
+
+    *cache = color;
+    lv_obj_set_style_bg_color(obj, lv_color_hex(color), 0);
+    return true;
+}
+
 static void ui_card_style(lv_obj_t *obj, uint32_t bg)
 {
     if (!obj) return;
@@ -810,7 +852,7 @@ static lv_obj_t *ui_make_status_value(lv_obj_t *parent, const char *name, int y)
 static void ui_set_status_value(lv_obj_t *label, const char *text, uint32_t bg, uint32_t fg)
 {
     if (!label) return;
-    lv_label_set_text(label, text);
+    ui_label_set_text_if_changed(label, text);
     lv_obj_set_style_bg_color(label, lv_color_hex(bg), 0);
     lv_obj_set_style_text_color(label, lv_color_hex(fg), 0);
 }
@@ -1057,7 +1099,7 @@ static void on_retry_close_clicked(lv_event_t *e)
     (void)e;
     g_retry_overlay_dismissed = true;
     if (retry_overlay) {
-        lv_obj_add_flag(retry_overlay, LV_OBJ_FLAG_HIDDEN);
+        ui_obj_set_hidden_if_changed(retry_overlay, true);
     }
 }
 
@@ -1080,7 +1122,7 @@ static void overlay_update_ip_label(lv_obj_t *label, const hmi_state_t *s)
     if (!label || !s) return;
     char buf[64];
     snprintf(buf, sizeof(buf), "ETH: %s", s->eth_ip[0] ? s->eth_ip : "offline");
-    lv_label_set_text(label, buf);
+    ui_label_set_text_if_changed(label, buf);
 }
 
 static void create_overlay_ui(lv_obj_t *screen)
@@ -1106,7 +1148,7 @@ static void create_overlay_ui(lv_obj_t *screen)
 
     overlay_title = lv_label_create(overlay_panel);
     ui_label_style(overlay_title, &lv_font_montserrat_24, 0x1B2B34);
-    lv_label_set_text(overlay_title, "Systemstart - Checkliste");
+    ui_label_set_text_if_changed(overlay_title, "Systemstart - Checkliste");
 
     overlay_text = lv_label_create(overlay_panel);
     lv_obj_set_width(overlay_text, lv_pct(100));
@@ -1134,7 +1176,7 @@ static void create_overlay_ui(lv_obj_t *screen)
     ui_label_style(overlay_ip_label, &lv_font_montserrat_16, 0xFFFFFF);
     lv_obj_set_style_text_opa(overlay_ip_label, LV_OPA_90, 0);
     lv_obj_align(overlay_ip_label, LV_ALIGN_BOTTOM_RIGHT, -18, -48);
-    lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+    ui_obj_set_hidden_if_changed(overlay, true);
 
     retry_overlay = lv_obj_create(screen);
     lv_obj_set_size(retry_overlay, lv_pct(100), lv_pct(100));
@@ -1157,7 +1199,7 @@ static void create_overlay_ui(lv_obj_t *screen)
 
     retry_title = lv_label_create(retry_panel);
     ui_label_style(retry_title, &lv_font_montserrat_24, 0x1B2B34);
-    lv_label_set_text(retry_title, "Weichentest laeuft");
+    ui_label_set_text_if_changed(retry_title, "Weichentest laeuft");
 
     retry_text = lv_label_create(retry_panel);
     lv_obj_set_width(retry_text, lv_pct(100));
@@ -1178,7 +1220,7 @@ static void create_overlay_ui(lv_obj_t *screen)
     ui_label_style(retry_ip_label, &lv_font_montserrat_16, 0xFFFFFF);
     lv_obj_set_style_text_opa(retry_ip_label, LV_OPA_90, 0);
     lv_obj_align(retry_ip_label, LV_ALIGN_BOTTOM_RIGHT, -18, -48);
-    lv_obj_add_flag(retry_overlay, LV_OBJ_FLAG_HIDDEN);
+    ui_obj_set_hidden_if_changed(retry_overlay, true);
 }
 
 static bool update_overlay_ui(const hmi_state_t *s)
@@ -1191,10 +1233,10 @@ static bool update_overlay_ui(const hmi_state_t *s)
                                (s->ui_m1_retry_overlay_active || s->ui_m2_retry_overlay_active));
 
     if (emergency_active) {
-        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+        ui_obj_set_hidden_if_changed(overlay, false);
         lv_obj_move_foreground(overlay);
-        lv_label_set_text(overlay_title, "Sicherheitsmeldung");
-        lv_label_set_text(overlay_text, "NOTAUS oder Sicherheitsquittierung ist aktiv. Ursache pruefen und erst danach quittieren.");
+        ui_label_set_text_if_changed(overlay_title, "Sicherheitsmeldung");
+        ui_label_set_text_if_changed(overlay_text, "NOTAUS oder Sicherheitsquittierung ist aktiv. Ursache pruefen und erst danach quittieren.");
 
         char st[192];
         snprintf(st, sizeof(st),
@@ -1203,23 +1245,23 @@ static bool update_overlay_ui(const hmi_state_t *s)
                  yesno(s->ack_required),
                  s->mega1_online ? "Online" : "Offline",
                  s->mega2_online ? "Online" : "Offline");
-        lv_label_set_text(overlay_status, st);
+        ui_label_set_text_if_changed(overlay_status, st);
 
-        lv_obj_add_flag(overlay_m1_btn, LV_OBJ_FLAG_HIDDEN);
+        ui_obj_set_hidden_if_changed(overlay_m1_btn, true);
         if (s->mega2_defects[0] != '\0' || s->startup_m2_needs) {
-            lv_obj_clear_flag(overlay_m2_btn, LV_OBJ_FLAG_HIDDEN);
+            ui_obj_set_hidden_if_changed(overlay_m2_btn, false);
             ui_set_button_enabled(overlay_m2_btn, snapshot_can_send_m2_startup_test(s), 0x00BCE3, 0x9DDDE8);
         } else {
-            lv_obj_add_flag(overlay_m2_btn, LV_OBJ_FLAG_HIDDEN);
+            ui_obj_set_hidden_if_changed(overlay_m2_btn, true);
         }
-        lv_obj_clear_flag(overlay_ack_btn, LV_OBJ_FLAG_HIDDEN);
+        ui_obj_set_hidden_if_changed(overlay_ack_btn, false);
         ui_set_button_enabled(overlay_ack_btn, snapshot_can_send_safety_ack(s), 0xF9D342, 0xDDC978);
         overlay_update_ip_label(overlay_ip_label, s);
     } else if (startup_active) {
-        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+        ui_obj_set_hidden_if_changed(overlay, false);
         lv_obj_move_foreground(overlay);
-        lv_label_set_text(overlay_title, "Systemstart - Checkliste");
-        lv_label_set_text(overlay_text, "Bitte die offenen Selftests ausfuehren. Quittieren wird erst freigegeben, wenn alle notwendigen Punkte OK sind.");
+        ui_label_set_text_if_changed(overlay_title, "Systemstart - Checkliste");
+        ui_label_set_text_if_changed(overlay_text, "Bitte die offenen Selftests ausfuehren. Quittieren wird erst freigegeben, wenn alle notwendigen Punkte OK sind.");
 
         char st[256];
         snprintf(st, sizeof(st),
@@ -1228,37 +1270,37 @@ static bool update_overlay_ui(const hmi_state_t *s)
                  selftest_text(s->startup_m2_done, s->startup_m2_running, g_pending_startup_m2),
                  yesno(s->ack_required),
                  s->can_write ? "Frei" : "Gesperrt");
-        lv_label_set_text(overlay_status, st);
+        ui_label_set_text_if_changed(overlay_status, st);
 
-        if (s->startup_m2_needs || !s->startup_m2_done) lv_obj_clear_flag(overlay_m2_btn, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(overlay_m2_btn, LV_OBJ_FLAG_HIDDEN);
-        if (s->startup_m1_needs || !s->startup_m1_done) lv_obj_clear_flag(overlay_m1_btn, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(overlay_m1_btn, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(overlay_ack_btn, LV_OBJ_FLAG_HIDDEN);
+        if (s->startup_m2_needs || !s->startup_m2_done) ui_obj_set_hidden_if_changed(overlay_m2_btn, false);
+        else ui_obj_set_hidden_if_changed(overlay_m2_btn, true);
+        if (s->startup_m1_needs || !s->startup_m1_done) ui_obj_set_hidden_if_changed(overlay_m1_btn, false);
+        else ui_obj_set_hidden_if_changed(overlay_m1_btn, true);
+        ui_obj_set_hidden_if_changed(overlay_ack_btn, false);
 
         ui_set_button_enabled(overlay_m2_btn, snapshot_can_send_m2_startup_test(s), 0x00BCE3, 0x9DDDE8);
         ui_set_button_enabled(overlay_m1_btn, snapshot_can_send_m1_startup_test(s), 0x00BCE3, 0x9DDDE8);
         ui_set_button_enabled(overlay_ack_btn, snapshot_can_send_startup_confirm(s), 0xF9D342, 0xDDC978);
         overlay_update_ip_label(overlay_ip_label, s);
     } else {
-        lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+        ui_obj_set_hidden_if_changed(overlay, true);
     }
 
     if (retry_active) {
-        lv_obj_clear_flag(retry_overlay, LV_OBJ_FLAG_HIDDEN);
+        ui_obj_set_hidden_if_changed(retry_overlay, false);
         lv_obj_move_foreground(retry_overlay);
-        lv_label_set_text(retry_title, "Weichentest laeuft");
-        lv_label_set_text(retry_text, "Ein Retry-Selbsttest wurde gestartet. Das HMI bleibt gesperrt, bis ETH den neuen Zustand meldet.");
+        ui_label_set_text_if_changed(retry_title, "Weichentest laeuft");
+        ui_label_set_text_if_changed(retry_text, "Ein Retry-Selbsttest wurde gestartet. Das HMI bleibt gesperrt, bis ETH den neuen Zustand meldet.");
 
         char st[160];
         snprintf(st, sizeof(st),
                  "Mega1: %s\nSBHF:  %s",
                  selftest_text(s->startup_m1_done, s->startup_m1_running, false),
                  selftest_text(s->startup_m2_done, s->startup_m2_running, false));
-        lv_label_set_text(retry_status, st);
+        ui_label_set_text_if_changed(retry_status, st);
         overlay_update_ip_label(retry_ip_label, s);
     } else {
-        lv_obj_add_flag(retry_overlay, LV_OBJ_FLAG_HIDDEN);
+        ui_obj_set_hidden_if_changed(retry_overlay, true);
     }
 
     return emergency_active || startup_active || retry_active;
@@ -1267,33 +1309,56 @@ static bool update_overlay_ui(const hmi_state_t *s)
 static void uart_ui_timer_cb(lv_timer_t *timer)
 {
     hmi_state_t s;
+    bool dirty = true;
 
     if (g_state_mutex && xSemaphoreTake(g_state_mutex, 0) == pdTRUE) {
         s = g_state;
+        dirty = g_ui_dirty;
         g_ui_dirty = false;
         xSemaphoreGive(g_state_mutex);
     } else {
         return;
     }
 
+    /* Globales Dirty-Gating:
+     * Ohne neue Daten oder lokale Button-Pending-Aenderung wird LVGL gar nicht
+     * angefasst. Das ist wichtiger als einzelne set_text-Optimierungen, weil
+     * bereits wiederholtes Layout/Style-Setzen grosse Flaechen invalidieren kann.
+     */
+    if (!dirty && g_last_rendered_valid) {
+        return;
+    }
+
     const bool overlay_visible = update_overlay_ui(&s);
+
 
     // Performance-Schutz: Solange ein Overlay sichtbar ist, bleibt die normale
     // Hintergrund-UI eingefroren. Dadurch werden rechte/linke Panels nicht
     // unnoetig neu gelayoutet oder neu gezeichnet, waehrend das Overlay die
     // Bedienung ohnehin sperrt. Overlay-Inhalte selbst bleiben oben aktuell.
     if (overlay_visible) {
+        g_last_overlay_visible = true;
         return;
     }
 
+    const bool overlay_just_closed = g_last_overlay_visible;
+    g_last_overlay_visible = false;
+
+    /* Nach dem Ausblenden eines Overlays einmal vollen Panel-Refresh zulassen,
+     * auch wenn sich die Werte waehrend des Overlays nur gesammelt haben.
+     */
+    if (overlay_just_closed) {
+        g_last_rendered_valid = false;
+    }
+
     if (power_led) {
-        lv_obj_set_style_bg_color(power_led,
-            s.power_on ? lv_color_hex(0x2ECC71) : lv_color_hex(0x555555), 0);
+        ui_obj_set_bg_color_if_changed(power_led, &g_power_led_bg_cache,
+            s.power_on ? 0x2ECC71 : 0x555555);
     }
 
     if (auto_led) {
-        lv_obj_set_style_bg_color(auto_led,
-            s.auto_mode ? lv_color_hex(0x2ECC71) : lv_color_hex(0x555555), 0);
+        ui_obj_set_bg_color_if_changed(auto_led, &g_auto_led_bg_cache,
+            s.auto_mode ? 0x2ECC71 : 0x555555);
     }
 
     const bool can_operate = s.can_write;
@@ -1308,7 +1373,7 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
     if (auto_btn) {
         lv_obj_t *auto_label = lv_obj_get_child(auto_btn, 0);
         if (auto_label) {
-            lv_label_set_text(auto_label, s.auto_mode ? "Manuell" : "Auto");
+            ui_label_set_text_if_changed(auto_label, s.auto_mode ? "Manuell" : "Auto");
         }
     }
 
@@ -1322,11 +1387,11 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
                  "Trafo oben:  %s\nTrafo unten: %s",
                  top,
                  bottom);
-        lv_label_set_text(trafo_label, trafo_buf);
+        ui_label_set_text_if_changed(trafo_label, trafo_buf);
     }
 
     if (write_label) {
-        lv_label_set_text(write_label, s.can_write ? "Bedienung: Frei" : "Bedienung gesperrt");
+        ui_label_set_text_if_changed(write_label, s.can_write ? "Bedienung: Frei" : "Bedienung gesperrt");
         lv_obj_set_style_text_color(write_label,
             s.can_write ? lv_color_hex(0x2ECC71) : lv_color_hex(0xF9D342), 0);
     }
@@ -1353,7 +1418,7 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
             (unsigned long)s.ws_diag_clients,
             s.can_write ? "frei" : "gesperrt"
         );
-        lv_label_set_text(system_label, sysbuf);
+        ui_label_set_text_if_changed(system_label, sysbuf);
     }
 
     if (eth_value_label) {
@@ -1400,21 +1465,24 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
         char m1_buf[192];
         snprintf(m1_buf, sizeof(m1_buf), "Mega1: %s",
                  s.mega1_defects[0] ? s.mega1_defects : "keine Defekte");
-        lv_label_set_text(fault_m1_label, m1_buf);
+        ui_label_set_text_if_changed(fault_m1_label, m1_buf);
     }
     if (fault_m2_label) {
         char m2_buf[192];
         snprintf(m2_buf, sizeof(m2_buf), "SBHF: %s",
                  s.mega2_defects[0] ? s.mega2_defects : "keine Defekte");
-        lv_label_set_text(fault_m2_label, m2_buf);
+        ui_label_set_text_if_changed(fault_m2_label, m2_buf);
     }
 
     // Defekte-Karte ist ein Flex-Container mit LV_SIZE_CONTENT.
-    // Dadurch waechst/schrumpft sie passend zu umgebrochenen Texten.
-    if (fault_card_obj) {
+    // Layout nur neu berechnen, wenn sich die Defekttexte wirklich geaendert haben.
+    const bool faults_changed = (!g_last_rendered_valid) ||
+        strcmp(s.mega1_defects, g_last_rendered_state.mega1_defects) != 0 ||
+        strcmp(s.mega2_defects, g_last_rendered_state.mega2_defects) != 0;
+    if (faults_changed && fault_card_obj) {
         lv_obj_update_layout(fault_card_obj);
     }
-    if (messages_card_obj && fault_card_obj) {
+    if (faults_changed && messages_card_obj && fault_card_obj) {
         lv_obj_align_to(messages_card_obj, fault_card_obj, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 8);
     }
 
@@ -1436,7 +1504,7 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
             has_message ? "" : "Keine Meldungen\n",
             s.sbhf_allowed_text[0] ? s.sbhf_allowed_text : "-"
         );
-        lv_label_set_text(messages_label, msg_buf);
+        ui_label_set_text_if_changed(messages_label, msg_buf);
         lv_obj_set_style_text_color(messages_label,
             has_message ? lv_color_hex(0xF9D342) : lv_color_hex(0x2ECC71), 0);
     }
@@ -1456,7 +1524,7 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
             (unsigned long)s.rx_bad_json,
             s.last_type
         );
-        lv_label_set_text(uart_status_label, status);
+        ui_label_set_text_if_changed(uart_status_label, status);
     }
 
     if (comm_status_label) {
@@ -1469,8 +1537,11 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
             (unsigned long)s.analog_frames,
             (unsigned long)s.other_frames
         );
-        lv_label_set_text(comm_status_label, comm);
+        ui_label_set_text_if_changed(comm_status_label, comm);
     }
+
+    g_last_rendered_state = s;
+    g_last_rendered_valid = true;
 }
 
 static void create_hmi_screen(void)
