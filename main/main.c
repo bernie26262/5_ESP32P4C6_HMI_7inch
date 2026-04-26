@@ -59,6 +59,26 @@ typedef struct {
     bool auto_mode;
     bool notaus_active;
     bool ack_required;
+    bool safety_lock;
+    bool startup_ready;
+    bool startup_checklist_active;
+    bool startup_m1_needs;
+    bool startup_m2_needs;
+    bool startup_m1_running;
+    bool startup_m2_running;
+    bool startup_m1_done;
+    bool startup_m2_done;
+    bool action_can_ack;
+    bool action_can_start_m1_selftest;
+    bool action_can_start_m2_selftest;
+    bool action_can_startup_confirm;
+    bool mega1_selftest_retry_available;
+    bool mega2_selftest_retry_available;
+    bool ui_startup_overlay_active;
+    bool ui_m1_retry_overlay_active;
+    bool ui_m2_retry_overlay_active;
+    char ui_overlay_mode[16];
+    char ui_retry_scope[16];
     bool mega1_online;
     bool mega2_online;
     bool warning_present;
@@ -106,7 +126,12 @@ static lv_obj_t *auto_btn = NULL;
 static lv_obj_t *trafo_label = NULL;
 static lv_obj_t *write_label = NULL;
 static lv_obj_t *system_label = NULL;
-static lv_obj_t *fault_label = NULL;
+static lv_obj_t *fault_card_obj = NULL;
+static lv_obj_t *messages_card_obj = NULL;
+static lv_obj_t *fault_m1_label = NULL;
+static lv_obj_t *fault_m2_label = NULL;
+static lv_obj_t *m1_retry_btn = NULL;
+static lv_obj_t *m2_retry_btn = NULL;
 static lv_obj_t *messages_label = NULL;
 
 static lv_obj_t *eth_value_label = NULL;
@@ -117,6 +142,32 @@ static lv_obj_t *warning_value_label = NULL;
 static lv_obj_t *power_value_label = NULL;
 static lv_obj_t *mode_value_label = NULL;
 static lv_obj_t *ws_diag_value_label = NULL;
+
+static lv_obj_t *overlay = NULL;
+static lv_obj_t *overlay_panel = NULL;
+static lv_obj_t *overlay_title = NULL;
+static lv_obj_t *overlay_text = NULL;
+static lv_obj_t *overlay_status = NULL;
+static lv_obj_t *overlay_m2_btn = NULL;
+static lv_obj_t *overlay_m1_btn = NULL;
+static lv_obj_t *overlay_ack_btn = NULL;
+static lv_obj_t *overlay_ip_label = NULL;
+
+static lv_obj_t *retry_overlay = NULL;
+static lv_obj_t *retry_panel = NULL;
+static lv_obj_t *retry_title = NULL;
+static lv_obj_t *retry_text = NULL;
+static lv_obj_t *retry_status = NULL;
+static lv_obj_t *retry_close_btn = NULL;
+static lv_obj_t *retry_ip_label = NULL;
+
+static bool g_startup_session_active = false;
+static bool g_retry_overlay_dismissed = false;
+static bool g_pending_startup_m1 = false;
+static bool g_pending_startup_m2 = false;
+static bool g_pending_startup_ack = false;
+static bool g_pending_m1_retry = false;
+static bool g_pending_m2_retry = false;
 
 static volatile bool g_ui_dirty = false;
 
@@ -425,6 +476,42 @@ static void hmi_state_update_from_json(const char *payload, uint32_t len)
             g_state.power_on = json_get_bool_path(root, "safety", "powerOn", g_state.power_on);
             g_state.notaus_active = json_get_bool_path(root, "safety", "notausActive", g_state.notaus_active);
             g_state.ack_required = json_get_bool_path(root, "safety", "ackRequired", g_state.ack_required);
+            g_state.safety_lock = json_get_bool_path(root, "safety", "lock", g_state.safety_lock);
+
+            g_state.startup_ready = json_get_bool_path(root, "startup", "ready", g_state.startup_ready);
+            g_state.startup_checklist_active = json_get_bool_path(root, "startup", "checklistActive", g_state.startup_checklist_active);
+            g_state.startup_m1_needs = json_get_bool_path(root, "startup", "m1Needs", g_state.startup_m1_needs);
+            g_state.startup_m2_needs = json_get_bool_path(root, "startup", "m2Needs", g_state.startup_m2_needs);
+            g_state.startup_m1_running = json_get_bool_path(root, "startup", "m1SelftestRunning", g_state.startup_m1_running);
+            g_state.startup_m2_running = json_get_bool_path(root, "startup", "m2SelftestRunning", g_state.startup_m2_running);
+            g_state.startup_m1_done = json_get_bool_path(root, "startup", "m1SelftestDone", g_state.startup_m1_done);
+            g_state.startup_m2_done = json_get_bool_path(root, "startup", "m2SelftestDone", g_state.startup_m2_done);
+
+            g_state.action_can_ack = json_get_bool_path(root, "actions", "canAck", g_state.action_can_ack);
+            g_state.action_can_start_m1_selftest = json_get_bool_path(root, "actions", "canStartM1Selftest", g_state.action_can_start_m1_selftest);
+            g_state.action_can_start_m2_selftest = json_get_bool_path(root, "actions", "canStartM2Selftest", g_state.action_can_start_m2_selftest);
+            g_state.action_can_startup_confirm = json_get_bool_path(root, "actions", "canStartupConfirm", g_state.action_can_startup_confirm);
+            g_state.mega1_selftest_retry_available = json_get_bool_path(root, "mega1", "selftestRetryAvailable", g_state.mega1_selftest_retry_available);
+            g_state.mega2_selftest_retry_available = json_get_bool_path(root, "mega2", "selftestRetryAvailable", g_state.mega2_selftest_retry_available);
+
+            g_state.ui_startup_overlay_active = json_get_bool_path(root, "ui", "startupOverlayActive", g_state.ui_startup_overlay_active);
+            g_state.ui_m1_retry_overlay_active = json_get_bool_path(root, "ui", "m1RetryOverlayActive", g_state.ui_m1_retry_overlay_active);
+            g_state.ui_m2_retry_overlay_active = json_get_bool_path(root, "ui", "m2RetryOverlayActive", g_state.ui_m2_retry_overlay_active);
+            json_get_string_path(root, "ui", "overlayMode", g_state.ui_overlay_mode, sizeof(g_state.ui_overlay_mode));
+            json_get_string_path(root, "ui", "retryScope", g_state.ui_retry_scope, sizeof(g_state.ui_retry_scope));
+
+            if (g_state.startup_m1_running || g_state.startup_m1_done || !g_state.startup_m1_needs) {
+                g_pending_startup_m1 = false;
+            }
+            if (g_state.startup_m2_running || g_state.startup_m2_done || !g_state.startup_m2_needs) {
+                g_pending_startup_m2 = false;
+            }
+            if (!g_state.ack_required && !g_state.startup_checklist_active) {
+                g_pending_startup_ack = false;
+            }
+            if (g_state.ui_m1_retry_overlay_active || g_state.ui_m2_retry_overlay_active) {
+                g_retry_overlay_dismissed = false;
+            }
 
             g_state.auto_mode = json_get_bool_path(root, "mega1", "modeAuto", g_state.auto_mode);
             g_state.mega1_online = json_get_bool_path(root, "mega1", "online", g_state.mega1_online);
@@ -475,6 +562,13 @@ static void hmi_state_update_from_json(const char *payload, uint32_t len)
                 if (sbhf_warning_mask & 0x02) append_text(g_state.mega2_defects, sizeof(g_state.mega2_defects), "W13 defekt");
                 if (sbhf_warning_mask & 0x04) append_text(g_state.mega2_defects, sizeof(g_state.mega2_defects), "W14 Stoerung");
                 if (sbhf_warning_mask & 0x08) append_text(g_state.mega2_defects, sizeof(g_state.mega2_defects), "W15 Stoerung");
+            }
+
+            if (g_state.startup_m1_running || !g_state.mega1_selftest_retry_available || g_state.mega1_defects[0] == '\0') {
+                g_pending_m1_retry = false;
+            }
+            if (g_state.startup_m2_running || !g_state.mega2_selftest_retry_available || g_state.mega2_defects[0] == '\0') {
+                g_pending_m2_retry = false;
             }
 
             json_get_string_path(root, "eth", "ip", g_state.eth_ip, sizeof(g_state.eth_ip));
@@ -739,6 +833,437 @@ static void ui_set_button_enabled(lv_obj_t *btn, bool enabled, uint32_t active_b
     }
 }
 
+
+static const char *selftest_text(bool done, bool running, bool pending)
+{
+    if (done) return "OK";
+    if (running || pending) return "LAEUFT";
+    return "OFFEN";
+}
+
+static bool snapshot_startup_all_done(const hmi_state_t *s)
+{
+    return ((!s->startup_m1_needs) || s->startup_m1_done) &&
+           ((!s->startup_m2_needs) || s->startup_m2_done);
+}
+
+static bool snapshot_emergency_overlay_active(const hmi_state_t *s)
+{
+    const bool startup_context = s->startup_checklist_active || s->startup_m1_needs || s->startup_m2_needs;
+    return s->notaus_active || (s->ack_required && !startup_context);
+}
+
+static bool snapshot_startup_overlay_active(const hmi_state_t *s)
+{
+    if (snapshot_emergency_overlay_active(s)) {
+        return false;
+    }
+
+    if (s->ui_startup_overlay_active ||
+        s->startup_checklist_active ||
+        s->startup_m1_needs ||
+        s->startup_m2_needs ||
+        s->ack_required) {
+        g_startup_session_active = true;
+    }
+
+    if (!s->ui_startup_overlay_active &&
+        !s->startup_checklist_active &&
+        snapshot_startup_all_done(s) &&
+        !s->ack_required &&
+        s->startup_ready) {
+        g_startup_session_active = false;
+    }
+
+    return g_startup_session_active;
+}
+
+static bool snapshot_can_send_m1_startup_test(const hmi_state_t *s)
+{
+    if (!s->can_write || g_pending_startup_m1) return false;
+    if (s->startup_m1_running || s->startup_m1_done) return false;
+    return s->action_can_start_m1_selftest || s->startup_m1_needs;
+}
+
+static bool snapshot_can_send_m2_startup_test(const hmi_state_t *s)
+{
+    if (!s->can_write || g_pending_startup_m2) return false;
+    if (s->startup_m2_running || s->startup_m2_done) return false;
+    return s->action_can_start_m2_selftest || s->startup_m2_needs || s->notaus_active;
+}
+
+static bool snapshot_can_send_startup_confirm(const hmi_state_t *s)
+{
+    if (!s->can_write || g_pending_startup_ack) return false;
+    if (!snapshot_startup_all_done(s)) return false;
+    return s->action_can_startup_confirm || s->ack_required || s->startup_checklist_active;
+}
+
+static bool snapshot_can_send_safety_ack(const hmi_state_t *s)
+{
+    if (!s->can_write || !s->ack_required) return false;
+    return s->action_can_ack || s->safety_lock || s->notaus_active;
+}
+
+static bool snapshot_has_m1_defect(const hmi_state_t *s)
+{
+    return s && s->mega1_defects[0] != '\0';
+}
+
+static bool snapshot_has_m2_defect(const hmi_state_t *s)
+{
+    return s && s->mega2_defects[0] != '\0';
+}
+
+static bool snapshot_can_send_m1_retry(const hmi_state_t *s)
+{
+    if (!s || !s->can_write || s->notaus_active || g_pending_m1_retry) return false;
+    if (!s->mega1_online || !snapshot_has_m1_defect(s)) return false;
+    if (!s->mega1_selftest_retry_available || s->startup_m1_running) return false;
+    return true;
+}
+
+static bool snapshot_can_send_m2_retry(const hmi_state_t *s)
+{
+    if (!s || !s->can_write || s->notaus_active || g_pending_m2_retry) return false;
+    if (!s->mega2_online || !snapshot_has_m2_defect(s)) return false;
+    if (!s->mega2_selftest_retry_available || s->startup_m2_running) return false;
+    return true;
+}
+
+static void send_startup_confirm_sequence(const hmi_state_t *s)
+{
+    if (s->mega1_online) {
+        hmi_uart_send_action("setAuto");
+    }
+    if (s->startup_m1_needs) {
+        hmi_uart_send_action("markMega1ChecklistDone");
+    }
+    if (s->startup_m2_needs) {
+        hmi_uart_send_action("markMega2ChecklistDone");
+    }
+    if (s->safety_lock || s->ack_required) {
+        hmi_uart_send_action("safetyAck");
+    }
+}
+
+static void on_overlay_m1_clicked(lv_event_t *e)
+{
+    (void)e;
+    hmi_state_t s;
+    bool send = false;
+    if (g_state_mutex && xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s = g_state;
+        send = snapshot_can_send_m1_startup_test(&s);
+        if (send) {
+            g_pending_startup_m1 = true;
+            g_ui_dirty = true;
+        }
+        xSemaphoreGive(g_state_mutex);
+    }
+    if (send) {
+        hmi_uart_send_action("m1SelftestStart");
+    }
+}
+
+static void on_overlay_m2_clicked(lv_event_t *e)
+{
+    (void)e;
+    hmi_state_t s;
+    bool send = false;
+    if (g_state_mutex && xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s = g_state;
+        send = snapshot_can_send_m2_startup_test(&s);
+        if (send) {
+            g_pending_startup_m2 = true;
+            g_ui_dirty = true;
+        }
+        xSemaphoreGive(g_state_mutex);
+    }
+    if (send) {
+        hmi_uart_send_action(snapshot_emergency_overlay_active(&s) ? "sbhfSelftestRetry" : "sbhfSelftestStartup");
+    }
+}
+
+static void on_overlay_ack_clicked(lv_event_t *e)
+{
+    (void)e;
+    hmi_state_t s;
+    bool send_ack = false;
+    bool send_startup = false;
+    if (g_state_mutex && xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s = g_state;
+        if (snapshot_emergency_overlay_active(&s)) {
+            send_ack = snapshot_can_send_safety_ack(&s);
+        } else {
+            send_startup = snapshot_can_send_startup_confirm(&s);
+        }
+        if (send_ack || send_startup) {
+            g_pending_startup_ack = true;
+            g_ui_dirty = true;
+        }
+        xSemaphoreGive(g_state_mutex);
+    }
+    if (send_ack) {
+        hmi_uart_send_action("safetyAck");
+    } else if (send_startup) {
+        send_startup_confirm_sequence(&s);
+    }
+}
+
+static void on_m1_retry_clicked(lv_event_t *e)
+{
+    (void)e;
+    hmi_state_t s;
+    bool send = false;
+    if (g_state_mutex && xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s = g_state;
+        send = snapshot_can_send_m1_retry(&s);
+        if (send) {
+            g_pending_m1_retry = true;
+            g_retry_overlay_dismissed = false;
+            g_ui_dirty = true;
+        }
+        xSemaphoreGive(g_state_mutex);
+    }
+    if (send) {
+        hmi_uart_send_action("powerOff");
+        hmi_uart_send_action("m1SelftestStart");
+    }
+}
+
+static void on_m2_retry_clicked(lv_event_t *e)
+{
+    (void)e;
+    hmi_state_t s;
+    bool send = false;
+    if (g_state_mutex && xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s = g_state;
+        send = snapshot_can_send_m2_retry(&s);
+        if (send) {
+            g_pending_m2_retry = true;
+            g_retry_overlay_dismissed = false;
+            g_ui_dirty = true;
+        }
+        xSemaphoreGive(g_state_mutex);
+    }
+    if (send) {
+        hmi_uart_send_action("sbhfSelftestRetry");
+    }
+}
+
+static void on_retry_close_clicked(lv_event_t *e)
+{
+    (void)e;
+    g_retry_overlay_dismissed = true;
+    if (retry_overlay) {
+        lv_obj_add_flag(retry_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static lv_obj_t *ui_make_overlay_button(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_height(btn, 52);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x00BCE3), 0);
+
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, text);
+    ui_label_style(label, &lv_font_montserrat_18, 0xFFFFFF);
+    lv_obj_center(label);
+    return btn;
+}
+
+static void overlay_update_ip_label(lv_obj_t *label, const hmi_state_t *s)
+{
+    if (!label || !s) return;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "ETH: %s", s->eth_ip[0] ? s->eth_ip : "offline");
+    lv_label_set_text(label, buf);
+}
+
+static void create_overlay_ui(lv_obj_t *screen)
+{
+    overlay = lv_obj_create(screen);
+    lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+    lv_obj_align(overlay, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
+    lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_set_style_pad_all(overlay, 0, 0);
+
+    overlay_panel = lv_obj_create(overlay);
+    lv_obj_set_width(overlay_panel, lv_pct(72));
+    lv_obj_set_height(overlay_panel, LV_SIZE_CONTENT);
+    lv_obj_center(overlay_panel);
+    lv_obj_set_style_radius(overlay_panel, 14, 0);
+    lv_obj_set_style_pad_all(overlay_panel, 18, 0);
+    lv_obj_set_layout(overlay_panel, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(overlay_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(overlay_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(overlay_panel, 10, 0);
+
+    overlay_title = lv_label_create(overlay_panel);
+    ui_label_style(overlay_title, &lv_font_montserrat_24, 0x1B2B34);
+    lv_label_set_text(overlay_title, "Systemstart - Checkliste");
+
+    overlay_text = lv_label_create(overlay_panel);
+    lv_obj_set_width(overlay_text, lv_pct(100));
+    lv_label_set_long_mode(overlay_text, LV_LABEL_LONG_WRAP);
+    ui_label_style(overlay_text, &lv_font_montserrat_16, 0x1B2B34);
+
+    overlay_status = lv_label_create(overlay_panel);
+    lv_obj_set_width(overlay_status, lv_pct(100));
+    lv_label_set_long_mode(overlay_status, LV_LABEL_LONG_WRAP);
+    ui_label_style(overlay_status, &lv_font_montserrat_16, 0x1B2B34);
+
+    overlay_m2_btn = ui_make_overlay_button(overlay_panel, "SBHF TEST");
+    lv_obj_set_width(overlay_m2_btn, lv_pct(100));
+    lv_obj_add_event_cb(overlay_m2_btn, on_overlay_m2_clicked, LV_EVENT_CLICKED, NULL);
+
+    overlay_m1_btn = ui_make_overlay_button(overlay_panel, "MEGA1 TEST");
+    lv_obj_set_width(overlay_m1_btn, lv_pct(100));
+    lv_obj_add_event_cb(overlay_m1_btn, on_overlay_m1_clicked, LV_EVENT_CLICKED, NULL);
+
+    overlay_ack_btn = ui_make_overlay_button(overlay_panel, "QUITTIEREN");
+    lv_obj_set_width(overlay_ack_btn, lv_pct(100));
+    lv_obj_add_event_cb(overlay_ack_btn, on_overlay_ack_clicked, LV_EVENT_CLICKED, NULL);
+
+    overlay_ip_label = lv_label_create(overlay);
+    ui_label_style(overlay_ip_label, &lv_font_montserrat_16, 0xFFFFFF);
+    lv_obj_set_style_text_opa(overlay_ip_label, LV_OPA_90, 0);
+    lv_obj_align(overlay_ip_label, LV_ALIGN_BOTTOM_RIGHT, -18, -48);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+
+    retry_overlay = lv_obj_create(screen);
+    lv_obj_set_size(retry_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_align(retry_overlay, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_opa(retry_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_bg_color(retry_overlay, lv_color_black(), 0);
+    lv_obj_set_style_border_width(retry_overlay, 0, 0);
+    lv_obj_set_style_pad_all(retry_overlay, 0, 0);
+
+    retry_panel = lv_obj_create(retry_overlay);
+    lv_obj_set_width(retry_panel, lv_pct(72));
+    lv_obj_set_height(retry_panel, LV_SIZE_CONTENT);
+    lv_obj_center(retry_panel);
+    lv_obj_set_style_radius(retry_panel, 14, 0);
+    lv_obj_set_style_pad_all(retry_panel, 18, 0);
+    lv_obj_set_layout(retry_panel, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(retry_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(retry_panel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(retry_panel, 10, 0);
+
+    retry_title = lv_label_create(retry_panel);
+    ui_label_style(retry_title, &lv_font_montserrat_24, 0x1B2B34);
+    lv_label_set_text(retry_title, "Weichentest laeuft");
+
+    retry_text = lv_label_create(retry_panel);
+    lv_obj_set_width(retry_text, lv_pct(100));
+    lv_label_set_long_mode(retry_text, LV_LABEL_LONG_WRAP);
+    ui_label_style(retry_text, &lv_font_montserrat_16, 0x1B2B34);
+    lv_label_set_text(retry_text, "Bitte warten ...");
+
+    retry_status = lv_label_create(retry_panel);
+    lv_obj_set_width(retry_status, lv_pct(100));
+    lv_label_set_long_mode(retry_status, LV_LABEL_LONG_WRAP);
+    ui_label_style(retry_status, &lv_font_montserrat_16, 0x1B2B34);
+
+    retry_close_btn = ui_make_overlay_button(retry_panel, "AUSBLENDEN");
+    lv_obj_set_width(retry_close_btn, lv_pct(100));
+    lv_obj_add_event_cb(retry_close_btn, on_retry_close_clicked, LV_EVENT_CLICKED, NULL);
+
+    retry_ip_label = lv_label_create(retry_overlay);
+    ui_label_style(retry_ip_label, &lv_font_montserrat_16, 0xFFFFFF);
+    lv_obj_set_style_text_opa(retry_ip_label, LV_OPA_90, 0);
+    lv_obj_align(retry_ip_label, LV_ALIGN_BOTTOM_RIGHT, -18, -48);
+    lv_obj_add_flag(retry_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+static bool update_overlay_ui(const hmi_state_t *s)
+{
+    if (!s || !overlay || !retry_overlay) return false;
+
+    const bool emergency_active = snapshot_emergency_overlay_active(s);
+    const bool startup_active = snapshot_startup_overlay_active(s);
+    const bool retry_active = (!emergency_active && !startup_active && !g_retry_overlay_dismissed &&
+                               (s->ui_m1_retry_overlay_active || s->ui_m2_retry_overlay_active));
+
+    if (emergency_active) {
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(overlay);
+        lv_label_set_text(overlay_title, "Sicherheitsmeldung");
+        lv_label_set_text(overlay_text, "NOTAUS oder Sicherheitsquittierung ist aktiv. Ursache pruefen und erst danach quittieren.");
+
+        char st[192];
+        snprintf(st, sizeof(st),
+                 "Safety: %s\nACK erforderlich: %s\nMega1: %s   Mega2: %s",
+                 s->notaus_active ? "NOTAUS" : "LOCK",
+                 yesno(s->ack_required),
+                 s->mega1_online ? "Online" : "Offline",
+                 s->mega2_online ? "Online" : "Offline");
+        lv_label_set_text(overlay_status, st);
+
+        lv_obj_add_flag(overlay_m1_btn, LV_OBJ_FLAG_HIDDEN);
+        if (s->mega2_defects[0] != '\0' || s->startup_m2_needs) {
+            lv_obj_clear_flag(overlay_m2_btn, LV_OBJ_FLAG_HIDDEN);
+            ui_set_button_enabled(overlay_m2_btn, snapshot_can_send_m2_startup_test(s), 0x00BCE3, 0x9DDDE8);
+        } else {
+            lv_obj_add_flag(overlay_m2_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_clear_flag(overlay_ack_btn, LV_OBJ_FLAG_HIDDEN);
+        ui_set_button_enabled(overlay_ack_btn, snapshot_can_send_safety_ack(s), 0xF9D342, 0xDDC978);
+        overlay_update_ip_label(overlay_ip_label, s);
+    } else if (startup_active) {
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(overlay);
+        lv_label_set_text(overlay_title, "Systemstart - Checkliste");
+        lv_label_set_text(overlay_text, "Bitte die offenen Selftests ausfuehren. Quittieren wird erst freigegeben, wenn alle notwendigen Punkte OK sind.");
+
+        char st[256];
+        snprintf(st, sizeof(st),
+                 "Mega1 Selftest: %s\nSBHF Selftest:  %s\nACK erforderlich: %s\nSchreibrechte: %s",
+                 selftest_text(s->startup_m1_done, s->startup_m1_running, g_pending_startup_m1),
+                 selftest_text(s->startup_m2_done, s->startup_m2_running, g_pending_startup_m2),
+                 yesno(s->ack_required),
+                 s->can_write ? "Frei" : "Gesperrt");
+        lv_label_set_text(overlay_status, st);
+
+        if (s->startup_m2_needs || !s->startup_m2_done) lv_obj_clear_flag(overlay_m2_btn, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(overlay_m2_btn, LV_OBJ_FLAG_HIDDEN);
+        if (s->startup_m1_needs || !s->startup_m1_done) lv_obj_clear_flag(overlay_m1_btn, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(overlay_m1_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(overlay_ack_btn, LV_OBJ_FLAG_HIDDEN);
+
+        ui_set_button_enabled(overlay_m2_btn, snapshot_can_send_m2_startup_test(s), 0x00BCE3, 0x9DDDE8);
+        ui_set_button_enabled(overlay_m1_btn, snapshot_can_send_m1_startup_test(s), 0x00BCE3, 0x9DDDE8);
+        ui_set_button_enabled(overlay_ack_btn, snapshot_can_send_startup_confirm(s), 0xF9D342, 0xDDC978);
+        overlay_update_ip_label(overlay_ip_label, s);
+    } else {
+        lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (retry_active) {
+        lv_obj_clear_flag(retry_overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(retry_overlay);
+        lv_label_set_text(retry_title, "Weichentest laeuft");
+        lv_label_set_text(retry_text, "Ein Retry-Selbsttest wurde gestartet. Das HMI bleibt gesperrt, bis ETH den neuen Zustand meldet.");
+
+        char st[160];
+        snprintf(st, sizeof(st),
+                 "Mega1: %s\nSBHF:  %s",
+                 selftest_text(s->startup_m1_done, s->startup_m1_running, false),
+                 selftest_text(s->startup_m2_done, s->startup_m2_running, false));
+        lv_label_set_text(retry_status, st);
+        overlay_update_ip_label(retry_ip_label, s);
+    } else {
+        lv_obj_add_flag(retry_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    return emergency_active || startup_active || retry_active;
+}
+
 static void uart_ui_timer_cb(lv_timer_t *timer)
 {
     hmi_state_t s;
@@ -748,6 +1273,16 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
         g_ui_dirty = false;
         xSemaphoreGive(g_state_mutex);
     } else {
+        return;
+    }
+
+    const bool overlay_visible = update_overlay_ui(&s);
+
+    // Performance-Schutz: Solange ein Overlay sichtbar ist, bleibt die normale
+    // Hintergrund-UI eingefroren. Dadurch werden rechte/linke Panels nicht
+    // unnoetig neu gelayoutet oder neu gezeichnet, waehrend das Overlay die
+    // Bedienung ohnehin sperrt. Overlay-Inhalte selbst bleiben oben aktuell.
+    if (overlay_visible) {
         return;
     }
 
@@ -861,15 +1396,30 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
                             s.can_write ? 0xFFFFFF : 0x101820);
     }
 
-    if (fault_label) {
-        char defect_buf[256];
-        snprintf(defect_buf, sizeof(defect_buf),
-            "Mega1: %s\nMega2: %s",
-            s.mega1_defects[0] ? s.mega1_defects : "keine Defekte",
-            s.mega2_defects[0] ? s.mega2_defects : "keine Defekte"
-        );
-        lv_label_set_text(fault_label, defect_buf);
+    if (fault_m1_label) {
+        char m1_buf[192];
+        snprintf(m1_buf, sizeof(m1_buf), "Mega1: %s",
+                 s.mega1_defects[0] ? s.mega1_defects : "keine Defekte");
+        lv_label_set_text(fault_m1_label, m1_buf);
     }
+    if (fault_m2_label) {
+        char m2_buf[192];
+        snprintf(m2_buf, sizeof(m2_buf), "SBHF: %s",
+                 s.mega2_defects[0] ? s.mega2_defects : "keine Defekte");
+        lv_label_set_text(fault_m2_label, m2_buf);
+    }
+
+    // Defekte-Karte ist ein Flex-Container mit LV_SIZE_CONTENT.
+    // Dadurch waechst/schrumpft sie passend zu umgebrochenen Texten.
+    if (fault_card_obj) {
+        lv_obj_update_layout(fault_card_obj);
+    }
+    if (messages_card_obj && fault_card_obj) {
+        lv_obj_align_to(messages_card_obj, fault_card_obj, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 8);
+    }
+
+    ui_set_button_enabled(m1_retry_btn, snapshot_can_send_m1_retry(&s), 0x2D7FF9, 0x53616A);
+    ui_set_button_enabled(m2_retry_btn, snapshot_can_send_m2_retry(&s), 0x2D7FF9, 0x53616A);
 
     if (messages_label) {
         const bool has_m1_defect = s.mega1_defects[0] != '\0';
@@ -1106,20 +1656,41 @@ static void create_hmi_screen(void)
     ws_diag_value_label = ui_make_status_value(system_card, "WS/Diag", 226);
 
     lv_obj_t *fault_card = lv_obj_create(right_panel);
-    lv_obj_set_size(fault_card, 276, 112);
+    fault_card_obj = fault_card;
+    lv_obj_set_width(fault_card, 276);
+    lv_obj_set_height(fault_card, LV_SIZE_CONTENT);
     lv_obj_align(fault_card, LV_ALIGN_TOP_LEFT, 8, 591);
     ui_card_style(fault_card, 0x20333C);
-    ui_section_title(fault_card, "Defekte", 8, 4);
-    fault_label = lv_label_create(fault_card);
-    lv_label_set_text(fault_label, "Mega1: keine Defekte\nMega2: keine Defekte");
-    lv_label_set_long_mode(fault_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(fault_label, 248);
-    ui_label_style(fault_label, &lv_font_montserrat_12, 0xFFFFFF);
-    lv_obj_align(fault_label, LV_ALIGN_TOP_LEFT, 8, 28);
+    lv_obj_set_layout(fault_card, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(fault_card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(fault_card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(fault_card, 7, 0);
+    lv_obj_set_style_pad_bottom(fault_card, 10, 0);
+    lv_obj_t *fault_title = ui_section_title(fault_card, "Defekte", 0, 0);
+    lv_obj_set_width(fault_title, 248);
+
+    fault_m1_label = lv_label_create(fault_card);
+    lv_label_set_text(fault_m1_label, "Mega1: keine Defekte");
+    lv_label_set_long_mode(fault_m1_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(fault_m1_label, 248);
+    ui_label_style(fault_m1_label, &lv_font_montserrat_12, 0xFFFFFF);
+
+    m1_retry_btn = ui_make_button(fault_card, "Mega1 Selftest Retry", 0, 0, 248, 34, 0x53616A, 0xFFFFFF);
+    lv_obj_add_event_cb(m1_retry_btn, on_m1_retry_clicked, LV_EVENT_CLICKED, NULL);
+
+    fault_m2_label = lv_label_create(fault_card);
+    lv_label_set_text(fault_m2_label, "SBHF: keine Defekte");
+    lv_label_set_long_mode(fault_m2_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(fault_m2_label, 248);
+    ui_label_style(fault_m2_label, &lv_font_montserrat_12, 0xFFFFFF);
+
+    m2_retry_btn = ui_make_button(fault_card, "SBHF Selftest Retry", 0, 0, 248, 34, 0x53616A, 0xFFFFFF);
+    lv_obj_add_event_cb(m2_retry_btn, on_m2_retry_clicked, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *messages_card = lv_obj_create(right_panel);
+    messages_card_obj = messages_card;
     lv_obj_set_size(messages_card, 276, 152);
-    lv_obj_align(messages_card, LV_ALIGN_TOP_LEFT, 8, 711);
+    lv_obj_align_to(messages_card, fault_card, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 8);
     ui_card_style(messages_card, 0x20333C);
     ui_section_title(messages_card, "Meldungen", 8, 4);
     messages_label = lv_label_create(messages_card);
@@ -1128,6 +1699,8 @@ static void create_hmi_screen(void)
     lv_obj_set_width(messages_label, 248);
     ui_label_style(messages_label, &lv_font_montserrat_12, 0x2ECC71);
     lv_obj_align(messages_label, LV_ALIGN_TOP_LEFT, 8, 30);
+
+    create_overlay_ui(screen);
 
     lv_timer_create(uart_ui_timer_cb, 250, NULL);
 }
