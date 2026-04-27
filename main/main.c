@@ -90,6 +90,22 @@ typedef struct {
     bool sbhf_restricted;
     char sbhf_allowed_text[32];
 
+    uint16_t mega1_weiche_ist_bits;
+    uint16_t mega1_weiche_soll_bits;
+    uint16_t mega2_turnout_ist_mask;
+    uint16_t mega2_turnout_soll_mask;
+
+    uint8_t mega1_bahnhof_mask;
+    bool mega1_bahnhof_valid;
+    uint16_t mega2_block_occ_mask;
+    bool mega2_block_occ_valid;
+    uint16_t mega2_signal_grant_mask;
+    bool mega2_signal_grant_valid;
+    uint8_t mega2_sbhf_state;
+    uint8_t mega2_sbhf_current_gleis;
+    bool mega2_block5_to_sbhf_active;
+    bool mega2_block5_to_sbhf_valid;
+
     int32_t trafo_oben_v10;
     int32_t trafo_unten_v10;
 
@@ -142,6 +158,22 @@ static lv_obj_t *warning_value_label = NULL;
 static lv_obj_t *power_value_label = NULL;
 static lv_obj_t *mode_value_label = NULL;
 static lv_obj_t *ws_diag_value_label = NULL;
+static lv_obj_t *left_tabview = NULL;
+static lv_obj_t *left_weichen_cmd_status_label = NULL;
+static lv_obj_t *left_station_cmd_status_label = NULL;
+static lv_obj_t *left_debug_summary_label = NULL;
+static lv_obj_t *left_m1_turnout_btns[12];
+static lv_obj_t *left_m1_turnout_labels[12];
+static lv_obj_t *left_sbhf_turnout_cards[4];
+static lv_obj_t *left_sbhf_turnout_labels[4];
+static lv_obj_t *left_station_cards[4];
+static lv_obj_t *left_station_labels[4];
+static lv_obj_t *left_station_led_green[4];
+static lv_obj_t *left_station_led_red[4];
+static lv_obj_t *left_block_occ_green[9];
+static lv_obj_t *left_block_occ_red[9];
+static lv_obj_t *left_block_grant_green[9];
+static lv_obj_t *left_block_grant_red[9];
 
 static lv_obj_t *overlay = NULL;
 static lv_obj_t *overlay_panel = NULL;
@@ -175,6 +207,9 @@ static bool g_last_rendered_valid = false;
 static bool g_last_overlay_visible = false;
 static uint32_t g_power_led_bg_cache = 0xFFFFFFFFu;
 static uint32_t g_auto_led_bg_cache = 0xFFFFFFFFu;
+
+static bool snapshot_emergency_overlay_active(const hmi_state_t *s);
+static void update_left_panel_ui(const hmi_state_t *s);
 
 static const cJSON *json_get_path(const cJSON *root, const char *a, const char *b)
 {
@@ -286,6 +321,35 @@ static uint32_t json_get_u32_path3(const cJSON *root, const char *a, const char 
     return json_item_u32(v, fallback);
 }
 
+static uint16_t json_get_u16_path(const cJSON *root, const char *a, const char *b, uint16_t fallback, uint16_t mask)
+{
+    return (uint16_t)(json_get_u32_path(root, a, b, fallback) & mask);
+}
+
+static bool json_try_get_u32_path(const cJSON *root, const char *a, const char *b, uint32_t *out)
+{
+    const cJSON *v = json_get_path(root, a, b);
+    if (!out || !cJSON_IsNumber(v)) return false;
+    *out = (uint32_t)v->valuedouble;
+    return true;
+}
+
+static bool json_try_get_u32_path3(const cJSON *root, const char *a, const char *b, const char *c, uint32_t *out)
+{
+    const cJSON *v = json_get_path3(root, a, b, c);
+    if (!out || !cJSON_IsNumber(v)) return false;
+    *out = (uint32_t)v->valuedouble;
+    return true;
+}
+
+static bool json_try_get_bool_path3(const cJSON *root, const char *a, const char *b, const char *c, bool *out)
+{
+    const cJSON *v = json_get_path3(root, a, b, c);
+    if (!out || !cJSON_IsBool(v)) return false;
+    *out = cJSON_IsTrue(v);
+    return true;
+}
+
 static int32_t json_get_i32_root(const cJSON *root, const char *key, int32_t fallback)
 {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, key);
@@ -346,6 +410,23 @@ static bool json_find_u32(const char *json, const char *key, uint32_t *out)
     return true;
 }
 
+static const char *turnout_dir_text(bool gerade)
+{
+    return gerade ? "G" : "A";
+}
+
+static void format_turnout_label(char *out, size_t out_len, unsigned turnout_no, bool valid, bool ist_gerade, bool soll_gerade)
+{
+    if (!out || out_len == 0) return;
+
+    if (!valid) {
+        snprintf(out, out_len, "W%u\nIst - | Soll -", turnout_no);
+        return;
+    }
+
+    snprintf(out, out_len, "W%u\nIst %s | Soll %s", turnout_no, turnout_dir_text(ist_gerade), turnout_dir_text(soll_gerade));
+}
+
 static void hmi_uart_send_ack(uint32_t seq)
 {
     if (seq == 0) return;
@@ -387,6 +468,146 @@ static void hmi_uart_send_action(const char *action)
     }
 
     ESP_LOGI(TAG, "TX action=%s", action);
+}
+
+static void hmi_uart_send_m1_weiche_set(uint8_t idx, bool gerade)
+{
+    if (idx >= 12u) return;
+
+    char line[128];
+    int len = snprintf(line, sizeof(line),
+                       "{\"type\":\"action\",\"action\":\"m1WeicheSet\",\"idx\":%u,\"gerade\":%s}\n",
+                       (unsigned)idx, gerade ? "true" : "false");
+
+    if (len <= 0 || len >= (int)sizeof(line)) return;
+
+    if (g_uart_tx_mutex) {
+        xSemaphoreTake(g_uart_tx_mutex, portMAX_DELAY);
+    }
+    uart_write_bytes(HMI_UART_NUM, line, len);
+    if (g_uart_tx_mutex) {
+        xSemaphoreGive(g_uart_tx_mutex);
+    }
+
+    ESP_LOGI(TAG, "TX action=m1WeicheSet idx=%u gerade=%u", (unsigned)idx, gerade ? 1u : 0u);
+}
+
+static void hmi_uart_send_m1_power_set(uint8_t bhf, bool on)
+{
+    if (bhf >= 4u) return;
+
+    char line[128];
+    int len = snprintf(line, sizeof(line),
+                       "{\"type\":\"action\",\"action\":\"m1PowerSet\",\"bhf\":%u,\"on\":%s}\n",
+                       (unsigned)bhf, on ? "true" : "false");
+
+    if (len <= 0 || len >= (int)sizeof(line)) return;
+
+    if (g_uart_tx_mutex) {
+        xSemaphoreTake(g_uart_tx_mutex, portMAX_DELAY);
+    }
+    uart_write_bytes(HMI_UART_NUM, line, len);
+    if (g_uart_tx_mutex) {
+        xSemaphoreGive(g_uart_tx_mutex);
+    }
+
+    ESP_LOGI(TAG, "TX action=m1PowerSet bhf=%u on=%u", (unsigned)bhf, on ? 1u : 0u);
+}
+
+static bool snapshot_overlay_blocks_left_commands(const hmi_state_t *s)
+{
+    if (!s) return true;
+    return g_startup_session_active ||
+           s->ui_startup_overlay_active ||
+           s->ui_m1_retry_overlay_active ||
+           s->ui_m2_retry_overlay_active ||
+           snapshot_emergency_overlay_active(s);
+}
+
+static bool snapshot_can_send_m1_weiche_cmd(const hmi_state_t *s)
+{
+    return s &&
+           s->can_write &&
+           s->mega1_online &&
+           s->startup_ready &&
+           !s->safety_lock &&
+           !s->notaus_active &&
+           !snapshot_overlay_blocks_left_commands(s);
+}
+
+static bool snapshot_can_send_bhf_cmd(const hmi_state_t *s)
+{
+    return s &&
+           s->can_write &&
+           s->mega1_online &&
+           s->startup_ready &&
+           s->mega1_bahnhof_valid &&
+           !s->safety_lock &&
+           !s->notaus_active &&
+           !snapshot_overlay_blocks_left_commands(s);
+}
+
+static const char *snapshot_left_command_block_reason(const hmi_state_t *s, bool require_bhf_data)
+{
+    if (!s) return "kein Status";
+    if (snapshot_overlay_blocks_left_commands(s)) return "Overlay aktiv";
+    if (!s->startup_ready) return "Startup aktiv";
+    if (s->notaus_active) return "Notaus aktiv";
+    if (s->safety_lock) return "Safety Lock";
+    if (!s->can_write) return "Diag aktiv";
+    if (!s->mega1_online) return "Mega1 offline";
+    if (require_bhf_data && !s->mega1_bahnhof_valid) return "keine Bahnhofsdaten";
+    return "frei";
+}
+
+static void left_set_clickable_feedback(lv_obj_t *obj, bool enabled)
+{
+    if (!obj) return;
+    if (enabled) {
+        lv_obj_clear_state(obj, LV_STATE_DISABLED);
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    } else {
+        lv_obj_add_state(obj, LV_STATE_DISABLED);
+        lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    }
+    lv_obj_set_style_text_opa(obj, LV_OPA_COVER, 0);
+}
+
+static void on_left_m1_turnout_clicked(lv_event_t *e)
+{
+    if (!e) return;
+    const uint8_t idx = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+    if (idx >= 12u) return;
+
+    hmi_state_t s;
+    memset(&s, 0, sizeof(s));
+    if (!g_state_mutex || xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+    s = g_state;
+    xSemaphoreGive(g_state_mutex);
+
+    if (!snapshot_can_send_m1_weiche_cmd(&s)) return;
+
+    // Toggle bewusst ueber IST, nicht ueber SOLL. ETH bleibt Single Source of Truth.
+    const bool ist_gerade = ((s.mega1_weiche_ist_bits & (1u << idx)) != 0u);
+    hmi_uart_send_m1_weiche_set(idx, !ist_gerade);
+}
+
+static void on_left_station_clicked(lv_event_t *e)
+{
+    if (!e) return;
+    const uint8_t bhf = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+    if (bhf >= 4u) return;
+
+    hmi_state_t s;
+    memset(&s, 0, sizeof(s));
+    if (!g_state_mutex || xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+    s = g_state;
+    xSemaphoreGive(g_state_mutex);
+
+    if (!snapshot_can_send_bhf_cmd(&s)) return;
+
+    const bool is_on = ((s.mega1_bahnhof_mask & (1u << bhf)) != 0u);
+    hmi_uart_send_m1_power_set(bhf, !is_on);
 }
 
 static void on_power_on_clicked(lv_event_t *e)
@@ -521,6 +742,68 @@ static void hmi_state_update_from_json(const char *payload, uint32_t len)
             g_state.auto_mode = json_get_bool_path(root, "mega1", "modeAuto", g_state.auto_mode);
             g_state.mega1_online = json_get_bool_path(root, "mega1", "online", g_state.mega1_online);
             g_state.mega2_online = json_get_bool_path(root, "mega2", "online", g_state.mega2_online);
+
+            /* Weichen-Daten: state-lite nutzt je nach ETH-Stand kurze oder explizite Feldnamen.
+             * Mega1-Bits bedeuten gerade. Bei SBHF/Mega2 sind die Masken historisch
+             * invertiert: Bit 0 bedeutet gerade, wenn es NICHT gesetzt ist.
+             */
+            g_state.mega1_weiche_ist_bits = json_get_u16_path(root, "mega1", "weicheIstBits", g_state.mega1_weiche_ist_bits, 0x0FFFu);
+            g_state.mega1_weiche_ist_bits = json_get_u16_path(root, "mega1", "weicheIstGeradeBits", g_state.mega1_weiche_ist_bits, 0x0FFFu);
+            g_state.mega1_weiche_soll_bits = json_get_u16_path(root, "mega1", "weicheSollBits", g_state.mega1_weiche_soll_bits, 0x0FFFu);
+            g_state.mega1_weiche_soll_bits = json_get_u16_path(root, "mega1", "weicheSollGeradeBits", g_state.mega1_weiche_soll_bits, 0x0FFFu);
+
+            g_state.mega2_turnout_ist_mask = json_get_u16_path(root, "mega2", "turnoutIstMask", g_state.mega2_turnout_ist_mask, 0x000Fu);
+            g_state.mega2_turnout_soll_mask = json_get_u16_path(root, "mega2", "turnoutSollMask", g_state.mega2_turnout_soll_mask, 0x000Fu);
+
+            uint32_t u32 = 0;
+            if (json_try_get_u32_path(root, "mega1", "bahnhofMask", &u32)) {
+                g_state.mega1_bahnhof_mask = (uint8_t)(u32 & 0x0Fu);
+                g_state.mega1_bahnhof_valid = true;
+            } else if (json_find_u32(payload, "\"bahnhofMask\"", &u32)) {
+                g_state.mega1_bahnhof_mask = (uint8_t)(u32 & 0x0Fu);
+                g_state.mega1_bahnhof_valid = true;
+            }
+
+            if (json_try_get_u32_path(root, "mega2", "blockOccMask", &u32) ||
+                json_try_get_u32_path(root, "mega2", "blockOccupiedMask", &u32) ||
+                json_try_get_u32_path(root, "mega2", "belegungMask", &u32) ||
+                json_find_u32(payload, "\"blockOccMask\"", &u32)) {
+                g_state.mega2_block_occ_mask = (uint16_t)(u32 & 0x01FFu);
+                g_state.mega2_block_occ_valid = true;
+            }
+
+            if (json_try_get_u32_path(root, "mega2", "signalGrantMask", &u32) ||
+                json_try_get_u32_path(root, "mega2", "signalGrantedMask", &u32) ||
+                json_try_get_u32_path(root, "mega2", "routeGrantMask", &u32) ||
+                json_try_get_u32_path(root, "mega2", "routeGrantedMask", &u32) ||
+                json_find_u32(payload, "\"signalGrantMask\"", &u32)) {
+                g_state.mega2_signal_grant_mask = (uint16_t)(u32 & 0x0FFFu);
+                g_state.mega2_signal_grant_valid = true;
+            }
+
+            if (json_try_get_u32_path3(root, "mega2", "sbhf", "state", &u32)) {
+                g_state.mega2_sbhf_state = (uint8_t)(u32 & 0xFFu);
+            }
+            if (json_try_get_u32_path3(root, "mega2", "sbhf", "currentGleis", &u32)) {
+                g_state.mega2_sbhf_current_gleis = (uint8_t)(u32 & 0xFFu);
+            }
+            bool b = false;
+            if (json_try_get_bool_path3(root, "mega2", "sbhf", "block5ToSbhfActive", &b)) {
+                g_state.mega2_block5_to_sbhf_active = b;
+                g_state.mega2_block5_to_sbhf_valid = true;
+            }
+
+            uint32_t turnout_bits = 0;
+            if (json_find_u32(payload, "\"mega1WeicheIstBits\"", &turnout_bits) ||
+                json_find_u32(payload, "\"mega1WeicheIstGeradeBits\"", &turnout_bits) ||
+                json_find_u32(payload, "\"weicheIstBits\"", &turnout_bits)) {
+                g_state.mega1_weiche_ist_bits = (uint16_t)(turnout_bits & 0x0FFFu);
+            }
+            if (json_find_u32(payload, "\"mega1WeicheSollBits\"", &turnout_bits) ||
+                json_find_u32(payload, "\"mega1WeicheSollGeradeBits\"", &turnout_bits) ||
+                json_find_u32(payload, "\"weicheSollBits\"", &turnout_bits)) {
+                g_state.mega1_weiche_soll_bits = (uint16_t)(turnout_bits & 0x0FFFu);
+            }
             const uint32_t mega1_warning_mask = json_get_u32_path(root, "mega1", "warningMask", 0);
             const uint32_t mega2_warning_mask = json_get_u32_path(root, "mega2", "warningMask", 0);
             const uint32_t sbhf_warning_mask = json_get_u32_path3(root, "mega2", "sbhf", "warningMask", 0);
@@ -727,11 +1010,6 @@ static void touch_event_cb(lv_event_t *e)
     char buf[64];
     snprintf(buf, sizeof(buf), "Touch: x=%ld y=%ld", (long)p.x, (long)p.y);
     lv_label_set_text(touch_label, buf);
-}
-
-static const char *onoff(bool v)
-{
-    return v ? "EIN" : "AUS";
 }
 
 static const char *yesno(bool v)
@@ -1223,6 +1501,7 @@ static void create_overlay_ui(lv_obj_t *screen)
     ui_obj_set_hidden_if_changed(retry_overlay, true);
 }
 
+
 static bool update_overlay_ui(const hmi_state_t *s)
 {
     if (!s || !overlay || !retry_overlay) return false;
@@ -1350,6 +1629,8 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
     if (overlay_just_closed) {
         g_last_rendered_valid = false;
     }
+
+    update_left_panel_ui(&s);
 
     if (power_led) {
         ui_obj_set_bg_color_if_changed(power_led, &g_power_led_bg_cache,
@@ -1544,101 +1825,257 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
     g_last_rendered_valid = true;
 }
 
-static void create_hmi_screen(void)
+static lv_obj_t *ui_make_pill(lv_obj_t *parent, const char *text, int x, int y, int w, int h, uint32_t bg, uint32_t fg)
 {
-    lv_obj_t *screen = lv_scr_act();
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x141D24), 0);
+    lv_obj_t *pill = lv_obj_create(parent);
+    lv_obj_set_size(pill, w, h);
+    lv_obj_align(pill, LV_ALIGN_TOP_LEFT, x, y);
+    lv_obj_set_style_bg_color(pill, lv_color_hex(bg), 0);
+    lv_obj_set_style_bg_opa(pill, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(pill, lv_color_hex(0x78909C), 0);
+    lv_obj_set_style_border_width(pill, 1, 0);
+    lv_obj_set_style_radius(pill, 8, 0);
+    lv_obj_set_style_pad_all(pill, 6, 0);
+    lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
 
-    const int right_w = 300;
-    const int gap = 8;
-    const int left_w = 1024 - right_w - (3 * gap);
+    lv_obj_t *label = lv_label_create(pill);
+    lv_label_set_text(label, text);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(label, w - 12);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    ui_label_style(label, &lv_font_montserrat_14, fg);
+    lv_obj_center(label);
+    return pill;
+}
 
-    lv_obj_t *left_panel = lv_obj_create(screen);
-    lv_obj_set_size(left_panel, left_w, 586);
-    lv_obj_align(left_panel, LV_ALIGN_LEFT_MID, gap, 0);
-    ui_card_style(left_panel, 0x24313A);
+static void ui_led_set_color(lv_obj_t *led, uint32_t color)
+{
+    if (!led) return;
+    lv_obj_set_style_bg_color(led, lv_color_hex(color), 0);
+}
 
+static lv_obj_t *ui_make_signal_led(lv_obj_t *parent, int x, int y, uint32_t color)
+{
+    lv_obj_t *led = lv_obj_create(parent);
+    lv_obj_set_size(led, 15, 15);
+    lv_obj_align(led, LV_ALIGN_TOP_LEFT, x, y);
+    lv_obj_set_style_radius(led, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(led, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_opa(led, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(led, lv_color_hex(0xDDE7EA), 0);
+    lv_obj_set_style_border_width(led, 1, 0);
+    lv_obj_clear_flag(led, LV_OBJ_FLAG_SCROLLABLE);
+    return led;
+}
+
+static bool text_contains_token(const char *text, const char *token)
+{
+    return text && token && strstr(text, token) != NULL;
+}
+
+static void left_set_dual_led(lv_obj_t *red_led, lv_obj_t *green_led, int state)
+{
+    // state: -1 = unknown, 0 = red, 1 = green
+    if (state < 0) {
+        ui_led_set_color(red_led, 0x555555);
+        ui_led_set_color(green_led, 0x555555);
+    } else if (state == 0) {
+        ui_led_set_color(red_led, 0xF25F4C);
+        ui_led_set_color(green_led, 0x555555);
+    } else {
+        ui_led_set_color(red_led, 0x555555);
+        ui_led_set_color(green_led, 0x2ECC71);
+    }
+}
+
+static void create_left_panel_tabs(lv_obj_t *left_panel, int left_w)
+{
     lv_obj_t *title = lv_label_create(left_panel);
     lv_label_set_text(title, "Elektrische Eisenbahn HMI");
     ui_label_style(title, &lv_font_montserrat_26, 0xFFFFFF);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 14, 8);
 
-    lv_obj_t *tabview = lv_tabview_create(left_panel, LV_DIR_TOP, 45);
-    lv_obj_set_size(tabview, left_w - 18, 525);
-    lv_obj_align(tabview, LV_ALIGN_BOTTOM_MID, 0, -2);
-    lv_obj_set_style_bg_color(tabview, lv_color_hex(0x2B3942), 0);
-    lv_obj_set_style_text_color(tabview, lv_color_hex(0xFFFFFF), 0);
+    left_tabview = lv_tabview_create(left_panel, LV_DIR_TOP, 45);
+    lv_obj_set_size(left_tabview, left_w - 18, 525);
+    lv_obj_align(left_tabview, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_bg_color(left_tabview, lv_color_hex(0x2B3942), 0);
+    lv_obj_set_style_text_color(left_tabview, lv_color_hex(0xFFFFFF), 0);
 
-    lv_obj_t *tab_weichen = lv_tabview_add_tab(tabview, "Weichen");
-    lv_obj_t *tab_bahnhoefe = lv_tabview_add_tab(tabview, "Bahnhoefe");
-    lv_obj_t *tab_bloecke = lv_tabview_add_tab(tabview, "Bloecke");
-    lv_obj_t *tab_debug = lv_tabview_add_tab(tabview, "Debug");
+    lv_obj_t *tab_weichen = lv_tabview_add_tab(left_tabview, "Weichen");
+    lv_obj_t *tab_bahnhoefe = lv_tabview_add_tab(left_tabview, "Bahnhoefe");
+    lv_obj_t *tab_bloecke = lv_tabview_add_tab(left_tabview, "Bloecke");
+    lv_obj_t *tab_debug = lv_tabview_add_tab(left_tabview, "Debug");
 
     lv_obj_set_style_bg_color(tab_weichen, lv_color_hex(0x2B3942), 0);
     lv_obj_set_style_bg_color(tab_bahnhoefe, lv_color_hex(0x2B3942), 0);
     lv_obj_set_style_bg_color(tab_bloecke, lv_color_hex(0x2B3942), 0);
     lv_obj_set_style_bg_color(tab_debug, lv_color_hex(0xF3EFE3), 0);
+    lv_obj_clear_flag(tab_weichen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_bahnhoefe, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_bloecke, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *m1_title = lv_label_create(tab_weichen);
-    lv_label_set_text(m1_title, "Mega1-Weichen");
-    ui_label_style(m1_title, &lv_font_montserrat_18, 0xFFFFFF);
-    lv_obj_align(m1_title, LV_ALIGN_TOP_LEFT, 8, 8);
+    lv_obj_t *m1_panel = lv_obj_create(tab_weichen);
+    lv_obj_set_size(m1_panel, left_w - 58, 282);
+    lv_obj_align(m1_panel, LV_ALIGN_TOP_LEFT, 8, 8);
+    ui_card_style(m1_panel, 0x2D3C45);
 
-    lv_obj_t *m1_state = lv_label_create(tab_weichen);
-    lv_label_set_text(m1_state,
-                      "W0: -/-   W1: -/-   W2: -/-   W3: -/-\n"
-                      "W4: -/-   W5: -/-   W6: -/-   W7: -/-\n"
-                      "W8: -/-   W9: -/-   W10: -/-  W11: -/-");
-    ui_label_style(m1_state, &lv_font_montserrat_16, 0xFFFFFF);
-    lv_obj_align(m1_state, LV_ALIGN_TOP_LEFT, 8, 38);
+    lv_obj_t *m1_title = lv_label_create(m1_panel);
+    lv_label_set_text(m1_title, "Mega1-Weichen W0-W11 (Bedienung)");
+    ui_label_style(m1_title, &lv_font_montserrat_16, 0xFFFFFF);
+    lv_obj_align(m1_title, LV_ALIGN_TOP_LEFT, 10, 8);
 
-    const char *btn_names[] = {"W0", "W1", "W2", "W3", "W4", "W5", "W6", "W7", "W8", "W9", "W10", "W11"};
+    left_weichen_cmd_status_label = lv_label_create(m1_panel);
+    lv_label_set_text(left_weichen_cmd_status_label, "Bedienung gesperrt");
+    ui_label_style(left_weichen_cmd_status_label, &lv_font_montserrat_14, 0xF9D342);
+    lv_obj_align(left_weichen_cmd_status_label, LV_ALIGN_TOP_RIGHT, -10, 10);
+
     for (int i = 0; i < 12; ++i) {
         int col = i % 4;
         int row = i / 4;
-        ui_make_button(tab_weichen, btn_names[i], 70 + col * 110, 120 + row * 62, 90, 48, 0x00BCE3, 0xFFFFFF);
+        int x = 10 + col * 150;
+        int y = 44 + row * 74;
+        left_m1_turnout_btns[i] = ui_make_pill(m1_panel, "", x, y, 135, 60, 0x1F5361, 0xFFFFFF);
+        left_m1_turnout_labels[i] = lv_obj_get_child(left_m1_turnout_btns[i], 0);
+        lv_obj_add_event_cb(left_m1_turnout_btns[i], on_left_m1_turnout_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+        char buf[48];
+        snprintf(buf, sizeof(buf), "W%d\nIst -- | Soll --", i);
+        ui_label_set_text_if_changed(left_m1_turnout_labels[i], buf);
     }
 
     lv_obj_t *sbhf_panel = lv_obj_create(tab_weichen);
-    lv_obj_set_size(sbhf_panel, left_w - 64, 135);
-    lv_obj_align(sbhf_panel, LV_ALIGN_BOTTOM_LEFT, 8, -12);
+    lv_obj_set_size(sbhf_panel, left_w - 58, 150);
+    lv_obj_align(sbhf_panel, LV_ALIGN_TOP_LEFT, 8, 304);
     ui_card_style(sbhf_panel, 0x2D3C45);
 
     lv_obj_t *sbhf_title = lv_label_create(sbhf_panel);
-    lv_label_set_text(sbhf_title, "SBHF-Weichen");
+    lv_label_set_text(sbhf_title, "SBHF-Weichen W12-W15 (Anzeige)");
     ui_label_style(sbhf_title, &lv_font_montserrat_16, 0xFFFFFF);
     lv_obj_align(sbhf_title, LV_ALIGN_TOP_LEFT, 10, 8);
 
-    lv_obj_t *sbhf_state = lv_label_create(sbhf_panel);
-    lv_label_set_text(sbhf_state, "W12: -/-   W13: -/-\nW14: -/-   W15: -/-");
-    ui_label_style(sbhf_state, &lv_font_montserrat_16, 0xFFFFFF);
-    lv_obj_align(sbhf_state, LV_ALIGN_TOP_LEFT, 10, 38);
 
-    lv_obj_t *bahnhoefe_label = lv_label_create(tab_bahnhoefe);
-    lv_label_set_text(bahnhoefe_label, "Bahnhoefe-Ansicht wird vorbereitet.");
-    ui_label_style(bahnhoefe_label, &lv_font_montserrat_22, 0xFFFFFF);
-    lv_obj_align(bahnhoefe_label, LV_ALIGN_TOP_LEFT, 10, 10);
+    for (int i = 0; i < 4; ++i) {
+        int w = 12 + i;
+        int x = 10 + i * 150;
+        left_sbhf_turnout_cards[i] = ui_make_pill(sbhf_panel, "", x, 52, 135, 62, 0x1F5361, 0xFFFFFF);
+        lv_obj_set_style_radius(left_sbhf_turnout_cards[i], 3, 0);
+        left_sbhf_turnout_labels[i] = lv_obj_get_child(left_sbhf_turnout_cards[i], 0);
+        char buf[48];
+        snprintf(buf, sizeof(buf), "W%d\nIst -- | Soll --", w);
+        ui_label_set_text_if_changed(left_sbhf_turnout_labels[i], buf);
+    }
 
-    lv_obj_t *bloecke_label = lv_label_create(tab_bloecke);
-    lv_label_set_text(bloecke_label, "Bloecke-Ansicht wird vorbereitet.");
-    ui_label_style(bloecke_label, &lv_font_montserrat_22, 0xFFFFFF);
-    lv_obj_align(bloecke_label, LV_ALIGN_TOP_LEFT, 10, 10);
+    lv_obj_t *bh_title = lv_label_create(tab_bahnhoefe);
+    lv_label_set_text(bh_title, "Bahnhoefe");
+    ui_label_style(bh_title, &lv_font_montserrat_22, 0xFFFFFF);
+    lv_obj_align(bh_title, LV_ALIGN_TOP_LEFT, 10, 10);
+
+    left_station_cmd_status_label = lv_label_create(tab_bahnhoefe);
+    lv_label_set_text(left_station_cmd_status_label, "Bedienung gesperrt");
+    ui_label_style(left_station_cmd_status_label, &lv_font_montserrat_14, 0xF9D342);
+    lv_obj_align(left_station_cmd_status_label, LV_ALIGN_TOP_RIGHT, -14, 16);
+
+    const char *station_names[] = {"Bhf0", "Bhf1", "Bhf2", "Bhf3"};
+    for (int i = 0; i < 4; ++i) {
+        int col = i % 4;
+        int row = i / 4;
+        int x = 10 + col * 150;
+        int y = 58 + row * 116;
+        lv_obj_t *card = lv_obj_create(tab_bahnhoefe);
+        left_station_cards[i] = card;
+        lv_obj_set_size(card, 135, 104);
+        lv_obj_align(card, LV_ALIGN_TOP_LEFT, x, y);
+        ui_card_style(card, 0x20333C);
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, on_left_station_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+
+        lv_obj_t *label = lv_label_create(card);
+        left_station_labels[i] = label;
+        lv_label_set_text(label, station_names[i]);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(label, 114);
+        ui_label_style(label, &lv_font_montserrat_14, 0xFFFFFF);
+        lv_obj_align(label, LV_ALIGN_TOP_LEFT, 12, 10);
+
+        left_station_led_red[i] = ui_make_signal_led(card, 18, 64, 0x555555);
+        left_station_led_green[i] = ui_make_signal_led(card, 50, 64, 0x555555);
+    }
+
+    lv_obj_t *bl_title = lv_label_create(tab_bloecke);
+    lv_label_set_text(bl_title, "Bloecke");
+    ui_label_style(bl_title, &lv_font_montserrat_22, 0xFFFFFF);
+    lv_obj_align(bl_title, LV_ALIGN_TOP_LEFT, 10, 10);
+
+
+    lv_obj_t *occ_panel = lv_obj_create(tab_bloecke);
+    lv_obj_set_size(occ_panel, left_w - 58, 190);
+    lv_obj_align(occ_panel, LV_ALIGN_TOP_LEFT, 8, 48);
+    ui_card_style(occ_panel, 0x2D3C45);
+
+    lv_obj_t *occ_title = lv_label_create(occ_panel);
+    lv_label_set_text(occ_title, "Blockbesetzt-Status");
+    ui_label_style(occ_title, &lv_font_montserrat_16, 0xFFFFFF);
+    lv_obj_align(occ_title, LV_ALIGN_TOP_LEFT, 10, 8);
+
+    const char *occ_names[] = {"Block 1", "Block 2", "Block 3", "Block 4", "Block 5", "SBHF 1", "SBHF 2", "SBHF 3", "Block 6"};
+    for (int i = 0; i < 9; ++i) {
+        int col = i % 3;
+        int row = i / 3;
+        int x = 10 + col * 200;
+        int y = 40 + row * 45;
+        lv_obj_t *label = lv_label_create(occ_panel);
+        lv_label_set_text(label, occ_names[i]);
+        ui_label_style(label, &lv_font_montserrat_14, 0xFFFFFF);
+        lv_obj_align(label, LV_ALIGN_TOP_LEFT, x, y + 4);
+        left_block_occ_red[i] = ui_make_signal_led(occ_panel, x + 94, y + 4, 0x555555);
+        left_block_occ_green[i] = ui_make_signal_led(occ_panel, x + 122, y + 4, 0x555555);
+    }
+
+    lv_obj_t *grant_panel = lv_obj_create(tab_bloecke);
+    lv_obj_set_size(grant_panel, left_w - 58, 190);
+    lv_obj_align(grant_panel, LV_ALIGN_TOP_LEFT, 8, 252);
+    ui_card_style(grant_panel, 0x2D3C45);
+
+    lv_obj_t *grant_title = lv_label_create(grant_panel);
+    lv_label_set_text(grant_title, "Blockfreigaben");
+    ui_label_style(grant_title, &lv_font_montserrat_16, 0xFFFFFF);
+    lv_obj_align(grant_title, LV_ALIGN_TOP_LEFT, 10, 8);
+
+    const char *grant_names[] = {"Block 1 -> 2", "Block 2 -> 3", "Block 3 -> 4", "Block 6 -> 4", "Block 4 -> 5", "Block 5 -> SBHF", "SBHF 1 -> Block6", "SBHF 2 -> Block6", "SBHF 3 -> Block6"};
+    for (int i = 0; i < 9; ++i) {
+        int col = i % 3;
+        int row = i / 3;
+        int x = 10 + col * 200;
+        int y = 40 + row * 45;
+        lv_obj_t *label = lv_label_create(grant_panel);
+        lv_label_set_text(label, grant_names[i]);
+        ui_label_style(label, &lv_font_montserrat_14, 0xFFFFFF);
+        lv_obj_align(label, LV_ALIGN_TOP_LEFT, x, y + 4);
+        left_block_grant_red[i] = ui_make_signal_led(grant_panel, x + 132, y + 4, 0x555555);
+        left_block_grant_green[i] = ui_make_signal_led(grant_panel, x + 160, y + 4, 0x555555);
+    }
 
     lv_obj_t *debug_title = lv_label_create(tab_debug);
     lv_label_set_text(debug_title, "Kommunikation");
     ui_label_style(debug_title, &lv_font_montserrat_24, 0x333333);
     lv_obj_align(debug_title, LV_ALIGN_TOP_LEFT, 12, 10);
 
+    left_debug_summary_label = lv_label_create(tab_debug);
+    lv_label_set_text(left_debug_summary_label, "Debug kompakt: RX/TX, ACK, Parser und Frame-Typen.");
+    lv_label_set_long_mode(left_debug_summary_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(left_debug_summary_label, left_w - 65);
+    ui_label_style(left_debug_summary_label, &lv_font_montserrat_14, 0x333333);
+    lv_obj_align(left_debug_summary_label, LV_ALIGN_TOP_LEFT, 12, 40);
+
     uart_status_label = lv_label_create(tab_debug);
     lv_label_set_text(uart_status_label, "UART RX: waiting...");
     lv_label_set_long_mode(uart_status_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(uart_status_label, left_w - 65);
     ui_label_style(uart_status_label, &lv_font_montserrat_16, 0x333333);
-    lv_obj_align(uart_status_label, LV_ALIGN_TOP_LEFT, 12, 52);
+    lv_obj_align(uart_status_label, LV_ALIGN_TOP_LEFT, 12, 74);
 
     lv_obj_t *frame_panel = lv_obj_create(tab_debug);
     lv_obj_set_size(frame_panel, 255, 142);
-    lv_obj_align(frame_panel, LV_ALIGN_TOP_LEFT, 12, 122);
+    lv_obj_align(frame_panel, LV_ALIGN_TOP_LEFT, 12, 145);
     ui_card_style(frame_panel, 0x17313A);
 
     lv_obj_t *frame_title = lv_label_create(frame_panel);
@@ -1653,7 +2090,7 @@ static void create_hmi_screen(void)
 
     lv_obj_t *touch_panel = lv_obj_create(tab_debug);
     lv_obj_set_size(touch_panel, 255, 95);
-    lv_obj_align(touch_panel, LV_ALIGN_TOP_LEFT, 285, 122);
+    lv_obj_align(touch_panel, LV_ALIGN_TOP_LEFT, 285, 145);
     ui_card_style(touch_panel, 0x17313A);
     lv_obj_add_event_cb(touch_panel, touch_event_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(touch_panel, touch_event_cb, LV_EVENT_PRESSING, NULL);
@@ -1665,12 +2102,164 @@ static void create_hmi_screen(void)
 
     frame_status_label = lv_label_create(tab_debug);
     lv_label_set_text(frame_status_label,
-                      "UART-Framing, JSON-Parser, State-Cache und ACK-Pfad laufen.\n"
+                      "UART-Framing, JSON-Parser, State-Cache, ACK-Pfad und globales Dirty-Gating laufen.\n"
                       "Roh-JSON wird nicht mehr angezeigt.");
     lv_label_set_long_mode(frame_status_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(frame_status_label, left_w - 65);
     ui_label_style(frame_status_label, &lv_font_montserrat_18, 0x333333);
-    lv_obj_align(frame_status_label, LV_ALIGN_TOP_LEFT, 12, 300);
+    lv_obj_align(frame_status_label, LV_ALIGN_TOP_LEFT, 12, 325);
+}
+
+static uint8_t left_block_occ_display_to_mask_bit(uint8_t display_idx)
+{
+    // UI-Reihenfolge: B1, B2, B3, B4, B5, SBHF1, SBHF2, SBHF3, B6.
+    // Mega2-Maskenreihenfolge: B1, B2, B3, B4, B5, B6, SBHF1, SBHF2, SBHF3.
+    static const uint8_t map[9] = {0, 1, 2, 3, 4, 6, 7, 8, 5};
+    return (display_idx < 9u) ? map[display_idx] : 0u;
+}
+
+static int left_grant_display_state(const hmi_state_t *s, uint8_t display_idx)
+{
+    if (!s || !s->mega2_online) return -1;
+
+    switch (display_idx) {
+        case 0:  // Block 1 -> 2
+        case 1:  // Block 2 -> 3
+        case 2:  // Block 3 -> 4
+        case 4:  // Block 4 -> 5
+            if (!s->mega2_signal_grant_valid) return -1;
+            return (s->mega2_signal_grant_mask & (1u << display_idx)) ? 1 : 0;
+
+        case 3:  // Block 6 -> 4
+            if (!s->mega2_signal_grant_valid) return -1;
+            return (s->mega2_signal_grant_mask & (1u << 11)) ? 1 : 0;
+
+        case 5:  // Block 5 -> SBHF
+            if (!s->mega2_block5_to_sbhf_valid) return -1;
+            return s->mega2_block5_to_sbhf_active ? 1 : 0;
+
+        case 6:  // SBHF 1 -> Block6
+        case 7:  // SBHF 2 -> Block6
+        case 8:  // SBHF 3 -> Block6
+            return (s->mega2_sbhf_state == 4u &&
+                    s->mega2_sbhf_current_gleis == (uint8_t)(display_idx - 5u)) ? 1 : 0;
+
+        default:
+            return -1;
+    }
+}
+
+static void update_left_panel_ui(const hmi_state_t *s)
+{
+    if (!s) return;
+
+    const bool weichen_cmd_enabled = snapshot_can_send_m1_weiche_cmd(s);
+    const bool bhf_cmd_enabled = snapshot_can_send_bhf_cmd(s);
+
+    if (left_weichen_cmd_status_label) {
+        char buf[80];
+        if (weichen_cmd_enabled) snprintf(buf, sizeof(buf), "Bedienung frei");
+        else snprintf(buf, sizeof(buf), "Bedienung gesperrt: %s", snapshot_left_command_block_reason(s, false));
+        ui_label_set_text_if_changed(left_weichen_cmd_status_label, buf);
+        lv_obj_set_style_text_color(left_weichen_cmd_status_label,
+            lv_color_hex(weichen_cmd_enabled ? 0x2ECC71 : 0xF9D342), 0);
+    }
+    if (left_station_cmd_status_label) {
+        char buf[80];
+        if (bhf_cmd_enabled) snprintf(buf, sizeof(buf), "Bedienung frei");
+        else snprintf(buf, sizeof(buf), "Bedienung gesperrt: %s", snapshot_left_command_block_reason(s, true));
+        ui_label_set_text_if_changed(left_station_cmd_status_label, buf);
+        lv_obj_set_style_text_color(left_station_cmd_status_label,
+            lv_color_hex(bhf_cmd_enabled ? 0x2ECC71 : 0xF9D342), 0);
+    }
+
+    for (int i = 0; i < 12; ++i) {
+        if (!left_m1_turnout_btns[i] || !left_m1_turnout_labels[i]) continue;
+        const bool valid = s->mega1_online;
+        const bool ist_gerade = ((s->mega1_weiche_ist_bits & (1u << i)) != 0u);
+        const bool soll_gerade = ((s->mega1_weiche_soll_bits & (1u << i)) != 0u);
+        const bool mismatch = valid && (ist_gerade != soll_gerade);
+        const uint32_t bg = !valid ? 0x53616A : (mismatch ? 0xA33939 : (weichen_cmd_enabled ? 0x1F5361 : 0x53616A));
+        lv_obj_set_style_bg_color(left_m1_turnout_btns[i], lv_color_hex(bg), 0);
+        left_set_clickable_feedback(left_m1_turnout_btns[i], weichen_cmd_enabled);
+        char label[56];
+        format_turnout_label(label, sizeof(label), (unsigned)i, valid, ist_gerade, soll_gerade);
+        if (!weichen_cmd_enabled) {
+            size_t used = strlen(label);
+            snprintf(label + used, sizeof(label) - used, "\ngesperrt");
+        }
+        ui_label_set_text_if_changed(left_m1_turnout_labels[i], label);
+        lv_obj_set_style_text_opa(left_m1_turnout_labels[i], LV_OPA_COVER, 0);
+    }
+
+
+    for (int i = 0; i < 4; ++i) {
+        if (!left_sbhf_turnout_cards[i] || !left_sbhf_turnout_labels[i]) continue;
+        const bool valid = s->mega2_online;
+        const bool ist_gerade = ((s->mega2_turnout_ist_mask & (1u << i)) == 0u);
+        const bool soll_gerade = ((s->mega2_turnout_soll_mask & (1u << i)) == 0u);
+        const bool mismatch = valid && (ist_gerade != soll_gerade);
+        const uint32_t bg = !valid ? 0x53616A : (mismatch ? 0xA33939 : 0x1F5361);
+        lv_obj_set_style_bg_color(left_sbhf_turnout_cards[i], lv_color_hex(bg), 0);
+        char label[40];
+        format_turnout_label(label, sizeof(label), (unsigned)(12 + i), valid, ist_gerade, soll_gerade);
+        ui_label_set_text_if_changed(left_sbhf_turnout_labels[i], label);
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        const bool valid = s->mega1_online && s->mega1_bahnhof_valid;
+        const int state = !valid ? -1 : ((s->mega1_bahnhof_mask & (1u << i)) ? 1 : 0);
+        left_set_dual_led(left_station_led_red[i], left_station_led_green[i], state);
+
+        if (left_station_cards[i]) {
+            const uint32_t card_bg = !valid ? 0x53616A : (bhf_cmd_enabled ? 0x20333C : 0x53616A);
+            lv_obj_set_style_bg_color(left_station_cards[i], lv_color_hex(card_bg), 0);
+            left_set_clickable_feedback(left_station_cards[i], bhf_cmd_enabled);
+        }
+        if (left_station_labels[i]) {
+            char label[56];
+            snprintf(label, sizeof(label), "Bhf%d\n%s%s", i,
+                     !valid ? "--" : (state == 1 ? "Ausfahrt frei" : "Ausfahrt stopp"),
+                     bhf_cmd_enabled ? "" : "\ngesperrt");
+            ui_label_set_text_if_changed(left_station_labels[i], label);
+            lv_obj_set_style_text_opa(left_station_labels[i], LV_OPA_COVER, 0);
+        }
+    }
+
+    for (int i = 0; i < 9; ++i) {
+        const bool occ_valid = s->mega2_online && s->mega2_block_occ_valid;
+        const uint8_t occ_bit = left_block_occ_display_to_mask_bit((uint8_t)i);
+        const int occ_state = !occ_valid ? -1 : ((s->mega2_block_occ_mask & (1u << occ_bit)) ? 0 : 1);
+        left_set_dual_led(left_block_occ_red[i], left_block_occ_green[i], occ_state);
+
+        left_set_dual_led(left_block_grant_red[i], left_block_grant_green[i], left_grant_display_state(s, (uint8_t)i));
+    }
+
+    if (left_debug_summary_label) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "RX %lu | ACK %lu | Typ %s | Dirty-Refresh aktiv",
+                 (unsigned long)s->rx_frames,
+                 (unsigned long)s->ack_sent,
+                 s->last_type[0] ? s->last_type : "-");
+        ui_label_set_text_if_changed(left_debug_summary_label, buf);
+    }
+}
+
+static void create_hmi_screen(void)
+{
+    lv_obj_t *screen = lv_scr_act();
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0x141D24), 0);
+
+    const int right_w = 300;
+    const int gap = 8;
+    const int left_w = 1024 - right_w - (3 * gap);
+
+    lv_obj_t *left_panel = lv_obj_create(screen);
+    lv_obj_set_size(left_panel, left_w, 586);
+    lv_obj_align(left_panel, LV_ALIGN_LEFT_MID, gap, 0);
+    ui_card_style(left_panel, 0x24313A);
+
+    create_left_panel_tabs(left_panel, left_w);
 
     lv_obj_t *right_panel = lv_obj_create(screen);
     lv_obj_set_size(right_panel, right_w, 586);
