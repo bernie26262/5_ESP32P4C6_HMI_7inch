@@ -82,6 +82,7 @@ typedef struct {
     bool mega1_online;
     bool mega2_online;
     bool warning_present;
+    uint32_t mega1_warning_mask;
     bool can_write;
     bool diag_active;
     uint32_t ws_base_clients;
@@ -174,6 +175,16 @@ static lv_obj_t *left_block_occ_green[9];
 static lv_obj_t *left_block_occ_red[9];
 static lv_obj_t *left_block_grant_green[9];
 static lv_obj_t *left_block_grant_red[9];
+static lv_obj_t *track_e1_block_occ_layer[3];
+static lv_obj_t *track_e1_turnout_layer[3][2]; // W9..W11, [0]=abbiegen, [1]=gerade
+static lv_obj_t *track_e1_turnout_warn_layer[3]; // W9..W11
+static lv_obj_t *track_e1_signal_box[4];   // Ebene 1: Grant 1->2, Grant 2->3, Bhf2, Bhf3
+static lv_obj_t *track_e1_signal_red[4];   // rote LED oben
+static lv_obj_t *track_e1_signal_green[4]; // gruene LED unten
+static lv_obj_t *track_e1_hitbox_turnout[3]; // Ebene 1: W9, W10, W11
+static lv_obj_t *track_e1_hitbox_station[2]; // Ebene 1: Bhf2, Bhf3
+static lv_obj_t *track_hitbox_flash_obj = NULL;
+static lv_timer_t *track_hitbox_flash_timer = NULL;
 
 static lv_obj_t *overlay = NULL;
 static lv_obj_t *overlay_panel = NULL;
@@ -804,9 +815,15 @@ static void hmi_state_update_from_json(const char *payload, uint32_t len)
                 json_find_u32(payload, "\"weicheSollBits\"", &turnout_bits)) {
                 g_state.mega1_weiche_soll_bits = (uint16_t)(turnout_bits & 0x0FFFu);
             }
-            const uint32_t mega1_warning_mask = json_get_u32_path(root, "mega1", "warningMask", 0);
+            uint32_t mega1_warning_mask = json_get_u32_path(root, "mega1", "warningMask", 0);
+            const uint32_t mega1_selftest_fail_mask = json_get_u32_path3(root, "mega1", "diag", "selftestFailMask", 0);
+            // ETH/state-lite exposes Mega1-Weichenfehler je nach Stand entweder
+            // als mega1.warningMask oder als mega1.diag.selftestFailMask. Fuer
+            // die Gleisbild-Warnsymbole beide Quellen zusammenfuehren.
+            mega1_warning_mask |= mega1_selftest_fail_mask;
             const uint32_t mega2_warning_mask = json_get_u32_path(root, "mega2", "warningMask", 0);
             const uint32_t sbhf_warning_mask = json_get_u32_path3(root, "mega2", "sbhf", "warningMask", 0);
+            g_state.mega1_warning_mask = mega1_warning_mask;
             g_state.warning_present = (mega1_warning_mask != 0) || (mega2_warning_mask != 0) || (sbhf_warning_mask != 0);
 
             g_state.ws_base_clients = json_get_u32_path(root, "wsClients", "base", g_state.ws_base_clients);
@@ -841,8 +858,7 @@ static void hmi_state_update_from_json(const char *payload, uint32_t len)
             json_get_string_path(root, "mega2", "defectList", g_state.mega2_defects, sizeof(g_state.mega2_defects));
 
             if (g_state.mega1_defects[0] == '\0') {
-                const uint32_t m1_selftest_fail_mask = json_get_u32_path3(root, "mega1", "diag", "selftestFailMask", 0);
-                build_turnout_defects(g_state.mega1_defects, sizeof(g_state.mega1_defects), m1_selftest_fail_mask, 0, 12, "");
+                build_turnout_defects(g_state.mega1_defects, sizeof(g_state.mega1_defects), mega1_selftest_fail_mask, 0, 12, "");
             }
 
             if (g_state.mega2_defects[0] == '\0') {
@@ -1888,6 +1904,528 @@ static void left_set_dual_led(lv_obj_t *red_led, lv_obj_t *green_led, int state)
     }
 }
 
+
+static lv_obj_t *track_make_line(lv_obj_t *parent, lv_point_t *pts, uint16_t count, uint32_t color, uint8_t width)
+{
+    lv_obj_t *line = lv_line_create(parent);
+    lv_line_set_points(line, pts, count);
+    lv_obj_set_style_line_color(line, lv_color_hex(color), 0);
+    lv_obj_set_style_line_width(line, width, 0);
+    lv_obj_set_style_line_rounded(line, false, 0);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    return line;
+}
+
+typedef struct {
+    int16_t x;
+    int16_t y;
+} track_src_point_t;
+
+static void track_scale_points(lv_point_t *dst, const track_src_point_t *src, uint16_t count, int32_t ox, int32_t oy, int32_t scale_q10)
+{
+    for (uint16_t i = 0; i < count; ++i) {
+        dst[i].x = (lv_coord_t)(ox + ((int32_t)src[i].x * scale_q10) / 1024);
+        dst[i].y = (lv_coord_t)(oy + ((int32_t)src[i].y * scale_q10) / 1024);
+    }
+}
+
+static void track_make_joint_fills(lv_obj_t *parent, const lv_point_t *pts, uint16_t count, uint32_t color, uint8_t width)
+{
+    // LVGLs lv_line does not render SVG-style miter joins. With thick polylines,
+    // sharp corners can show small cut-outs. We close only the internal vertices
+    // with small square fills. Unlike round caps, these do not create visible
+    // "Kugel" artifacts at the connection points or line ends.
+    if (count < 3) return;
+
+    int fill = (int)width - 1;
+    if (fill < 4) fill = 4;
+
+    for (uint16_t i = 1; i + 1 < count; ++i) {
+        lv_obj_t *joint = lv_obj_create(parent);
+        lv_obj_set_size(joint, fill, fill);
+        lv_obj_set_pos(joint, pts[i].x - fill / 2, pts[i].y - fill / 2);
+        lv_obj_set_style_radius(joint, 0, 0);
+        lv_obj_set_style_bg_color(joint, lv_color_hex(color), 0);
+        lv_obj_set_style_bg_opa(joint, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(joint, 0, 0);
+        lv_obj_clear_flag(joint, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(joint, LV_OBJ_FLAG_SCROLLABLE);
+    }
+}
+
+static lv_obj_t *track_make_scaled_line(lv_obj_t *parent, lv_point_t *dst, const track_src_point_t *src,
+                                        uint16_t count, int32_t ox, int32_t oy, int32_t scale_q10,
+                                        uint32_t color, uint8_t width)
+{
+    track_scale_points(dst, src, count, ox, oy, scale_q10);
+    lv_obj_t *line = track_make_line(parent, dst, count, color, width);
+    track_make_joint_fills(parent, dst, count, color, width);
+    return line;
+}
+
+static lv_obj_t *track_make_scaled_warn_triangle(lv_obj_t *parent, lv_point_t *dst, const track_src_point_t *src,
+                                                 int32_t ox, int32_t oy, int32_t scale_q10,
+                                                 uint32_t color, uint8_t width)
+{
+    // Warnzeichen werden wieder aus den gezeichneten HMI_weiche_wX_warn.svg-
+    // Koordinaten gerendert. Die Sichtbarkeit bleibt robust ueber warningMask
+    // plus Fallback auf die Defekttexte gesteuert.
+    track_scale_points(dst, src, 4, ox, oy, scale_q10);
+
+    lv_obj_t *line = lv_line_create(parent);
+    lv_line_set_points(line, dst, 4);
+    lv_obj_set_style_line_color(line, lv_color_hex(color), 0);
+    lv_obj_set_style_line_opa(line, LV_OPA_COVER, 0);
+    lv_obj_set_style_line_width(line, width, 0);
+    // Nur Warnsymbole bekommen runde Linienenden/Ecken. Die Gleislinien bleiben
+    // bewusst eckig, damit dort keine Kugel-Artefakte entstehen.
+    lv_obj_set_style_line_rounded(line, true, 0);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    return line;
+}
+
+static lv_obj_t *track_make_overlay_layer(lv_obj_t *parent, int w, int h)
+{
+    lv_obj_t *layer = lv_obj_create(parent);
+    lv_obj_set_size(layer, w, h);
+    lv_obj_set_pos(layer, 0, 0);
+    lv_obj_set_style_bg_opa(layer, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(layer, 0, 0);
+    lv_obj_set_style_pad_all(layer, 0, 0);
+    lv_obj_clear_flag(layer, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(layer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(layer, LV_OBJ_FLAG_HIDDEN);
+    return layer;
+}
+
+static void track_set_layer_color(lv_obj_t *layer, uint32_t color)
+{
+    if (!layer) return;
+
+    const lv_color_t c = lv_color_hex(color);
+    uint32_t child_count = lv_obj_get_child_cnt(layer);
+    for (uint32_t i = 0; i < child_count; ++i) {
+        lv_obj_t *child = lv_obj_get_child(layer, i);
+        if (!child) continue;
+        lv_obj_set_style_line_color(child, c, 0);
+        lv_obj_set_style_bg_color(child, c, 0);
+    }
+}
+
+static lv_obj_t *track_make_signal_dot(lv_obj_t *parent, int cx, int cy, int diameter, uint32_t color)
+{
+    lv_obj_t *dot = lv_obj_create(parent);
+    lv_obj_set_size(dot, diameter, diameter);
+    lv_obj_align(dot, LV_ALIGN_TOP_LEFT, cx - diameter / 2, cy - diameter / 2);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(dot, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(dot, lv_color_hex(0x111111), 0);
+    lv_obj_set_style_border_width(dot, 1, 0);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+    return dot;
+}
+
+static lv_obj_t *track_make_signal_box(lv_obj_t *parent, int x, int y, int w, int h)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_set_size(box, w, h);
+    lv_obj_align(box, LV_ALIGN_TOP_LEFT, x, y);
+    lv_obj_set_style_radius(box, 4, 0);
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_30, 0);
+    lv_obj_set_style_border_color(box, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(box, 2, 0);
+    lv_obj_set_style_pad_all(box, 0, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    return box;
+}
+
+static void track_set_grant_signal(lv_obj_t *red_led, lv_obj_t *green_led, int state)
+{
+    // state: -1 = unbekannt/offline, 0 = nicht freigegeben, 1 = freigegeben
+    if (state < 0) {
+        ui_led_set_color(red_led, 0x555555);
+        ui_led_set_color(green_led, 0x555555);
+    } else if (state == 0) {
+        ui_led_set_color(red_led, 0xF25F4C);
+        ui_led_set_color(green_led, 0x2A3A2F);
+    } else {
+        ui_led_set_color(red_led, 0x3A2A2A);
+        ui_led_set_color(green_led, 0x2ECC71);
+    }
+}
+
+static void track_hitbox_flash_hide_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (track_hitbox_flash_obj) {
+        lv_obj_set_style_bg_opa(track_hitbox_flash_obj, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(track_hitbox_flash_obj, 0, 0);
+        track_hitbox_flash_obj = NULL;
+    }
+    if (track_hitbox_flash_timer) {
+        lv_timer_pause(track_hitbox_flash_timer);
+    }
+}
+
+static void track_hitbox_flash_pressed_cb(lv_event_t *e)
+{
+    lv_obj_t *box = lv_event_get_target(e);
+    if (!box) return;
+
+    if (track_hitbox_flash_obj && track_hitbox_flash_obj != box) {
+        lv_obj_set_style_bg_opa(track_hitbox_flash_obj, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(track_hitbox_flash_obj, 0, 0);
+    }
+
+    track_hitbox_flash_obj = box;
+    lv_obj_set_style_radius(box, 8, 0);
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x00BCE3), 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_30, 0);
+    lv_obj_set_style_border_color(box, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(box, 2, 0);
+
+    if (!track_hitbox_flash_timer) {
+        track_hitbox_flash_timer = lv_timer_create(track_hitbox_flash_hide_cb, 220, NULL);
+    }
+    lv_timer_set_period(track_hitbox_flash_timer, 220);
+    lv_timer_reset(track_hitbox_flash_timer);
+    lv_timer_resume(track_hitbox_flash_timer);
+}
+
+static lv_obj_t *track_make_hitbox(lv_obj_t *parent, int x, int y, int w, int h, lv_event_cb_t cb, void *user_data)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_set_size(box, w, h);
+    lv_obj_align(box, LV_ALIGN_TOP_LEFT, x, y);
+    lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(box, 0, 0);
+    lv_obj_set_style_outline_width(box, 0, 0);
+    lv_obj_set_style_pad_all(box, 0, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(box, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(box, track_hitbox_flash_pressed_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(box, cb, LV_EVENT_CLICKED, user_data);
+    return box;
+}
+
+static lv_obj_t *track_make_layer_button(lv_obj_t *parent, const char *text, int x, int y, int w, bool active)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, w, 32);
+    lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(active ? 0x00BCE3 : 0x53616A), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(active ? 0xBEEFFF : 0x7E8B92), 0);
+    lv_obj_set_style_border_width(btn, active ? 2 : 1, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, text);
+    ui_label_style(label, &lv_font_montserrat_14, 0xFFFFFF);
+    lv_obj_center(label);
+    return btn;
+}
+
+static void create_track_tab_ebene1_start(lv_obj_t *tab, int left_w)
+{
+    lv_obj_set_style_bg_color(tab, lv_color_hex(0x2B3942), 0);
+    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Zweite Ebene innerhalb des Gleisbild-Tabs. Ebene 0 und Ebene -1 sind
+    // bewusst zunaechst nur vorbereitet; gezeichnet wird aktuell nur Ebene 1.
+    track_make_layer_button(tab, "Ebene 1", 12, 8, 112, true);
+    track_make_layer_button(tab, "Ebene 0", 132, 8, 112, false);
+    track_make_layer_button(tab, "Ebene -1", 252, 8, 112, false);
+
+    lv_obj_t *panel = lv_obj_create(tab);
+    const int panel_w = left_w - 58;
+    const int panel_h = 438;
+    lv_obj_set_size(panel, panel_w, panel_h);
+    lv_obj_align(panel, LV_ALIGN_TOP_LEFT, 14, 48);
+    ui_card_style(panel, 0x17313A);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    const int32_t usable_w = panel_w - 22;
+    const int32_t usable_h = panel_h - 22;
+    int32_t sx_q10 = (usable_w * 1024) / 1280;
+    int32_t sy_q10 = (usable_h * 1024) / 720;
+    int32_t scale_q10 = sx_q10 < sy_q10 ? sx_q10 : sy_q10;
+    if (scale_q10 <= 0) scale_q10 = 1;
+
+    const int32_t draw_w = (1280 * scale_q10) / 1024;
+    const int32_t draw_h = (720 * scale_q10) / 1024;
+    const int32_t ox = 11 + (usable_w - draw_w) / 2;
+    const int32_t oy = 11 + (usable_h - draw_h) / 2;
+
+    int line_w = (int)((15 * scale_q10) / 1024);
+    if (line_w < 5) line_w = 5;
+    if (line_w > 12) line_w = 12;
+
+    const uint32_t rail = 0xFFFFFF;
+
+    // Ebene 1: Track-Layout aus HMI_ebene1_base.svg, SVG-Referenz 1280x720.
+    // Die HMI-SVG ist bereits als wenige zusammenhaengende Linienzuege aufgebaut.
+    // Dadurch entstehen in LVGL nur wenige lv_line-Objekte und die Knicke bleiben sauber.
+    // Weichen, Warnsymbole, Blockbelegung, Blockfreigaben und Klickflaechen
+    // kommen spaeter als separate Objekte darueber.
+    static const track_src_point_t e1_outer[] = {
+        {829, 86}, {370, 86}, {227, 229}, {227, 511}, {368, 652},
+        {641, 652}, {740, 553}, {966, 553}, {1064, 455}, {1064, 286},
+        {971, 193}, {427, 193}, {324, 296}
+    };
+
+    static const track_src_point_t e1_top_diag[] = {
+        {494, 86}, {600, 193}
+    };
+
+    static const track_src_point_t e1_inner[] = {
+        {875, 553}, {604, 282}, {498, 282}, {412, 368}
+    };
+
+    static lv_point_t p_outer[sizeof(e1_outer) / sizeof(e1_outer[0])];
+    static lv_point_t p_top_diag[sizeof(e1_top_diag) / sizeof(e1_top_diag[0])];
+    static lv_point_t p_inner[sizeof(e1_inner) / sizeof(e1_inner[0])];
+
+    track_make_scaled_line(panel, p_outer, e1_outer,
+                           (uint16_t)(sizeof(e1_outer) / sizeof(e1_outer[0])),
+                           ox, oy, scale_q10, rail, (uint8_t)line_w);
+    track_make_scaled_line(panel, p_top_diag, e1_top_diag,
+                           (uint16_t)(sizeof(e1_top_diag) / sizeof(e1_top_diag[0])),
+                           ox, oy, scale_q10, rail, (uint8_t)line_w);
+    track_make_scaled_line(panel, p_inner, e1_inner,
+                           (uint16_t)(sizeof(e1_inner) / sizeof(e1_inner[0])),
+                           ox, oy, scale_q10, rail, (uint8_t)line_w);
+
+    // Blockbesetzt-Linien fuer Ebene 1 aus den HMI_block_e1_bX_occ.svg-Dateien.
+    // Diese Overlays liegen ueber dem Gleis, sind duenne rote Linien und bleiben
+    // bei frei/undef unsichtbar. Sie werden einmal erzeugt und spaeter nur
+    // ein-/ausgeblendet.
+    int occ_line_w = (line_w * 3 + 2) / 5;
+    if (occ_line_w < 3) occ_line_w = 3;
+    const uint32_t occ_red = 0xF25F4C;
+
+    track_e1_block_occ_layer[0] = track_make_overlay_layer(panel, panel_w, panel_h);
+    track_e1_block_occ_layer[1] = track_make_overlay_layer(panel, panel_w, panel_h);
+    track_e1_block_occ_layer[2] = track_make_overlay_layer(panel, panel_w, panel_h);
+
+    static const track_src_point_t e1_b1_occ[] = {
+        {325, 297}, {407, 215}
+    };
+    static const track_src_point_t e1_b2_occ_0[] = {
+        {560, 87}, {828, 87}
+    };
+    static const track_src_point_t e1_b2_occ_1[] = {
+        {448, 194}, {535, 194}
+    };
+    static const track_src_point_t e1_b2_occ_2[] = {
+        {828, 505}, {604, 282}, {523, 282}
+    };
+    static const track_src_point_t e1_b2_occ_3[] = {
+        {442, 87}, {370, 87}, {226, 232}, {226, 513}, {366, 653},
+        {640, 653}, {740, 553}, {811, 553}
+    };
+    static const track_src_point_t e1_b2_occ_4[] = {
+        {925, 552}, {967, 552}, {1065, 454}, {1065, 287}, {971, 193},
+        {657, 193}
+    };
+    static const track_src_point_t e1_b3_occ[] = {
+        {412, 367}, {480, 300}
+    };
+
+    static lv_point_t p_b1_occ[sizeof(e1_b1_occ) / sizeof(e1_b1_occ[0])];
+    static lv_point_t p_b2_occ_0[sizeof(e1_b2_occ_0) / sizeof(e1_b2_occ_0[0])];
+    static lv_point_t p_b2_occ_1[sizeof(e1_b2_occ_1) / sizeof(e1_b2_occ_1[0])];
+    static lv_point_t p_b2_occ_2[sizeof(e1_b2_occ_2) / sizeof(e1_b2_occ_2[0])];
+    static lv_point_t p_b2_occ_3[sizeof(e1_b2_occ_3) / sizeof(e1_b2_occ_3[0])];
+    static lv_point_t p_b2_occ_4[sizeof(e1_b2_occ_4) / sizeof(e1_b2_occ_4[0])];
+    static lv_point_t p_b3_occ[sizeof(e1_b3_occ) / sizeof(e1_b3_occ[0])];
+
+    track_make_scaled_line(track_e1_block_occ_layer[0], p_b1_occ, e1_b1_occ,
+                           (uint16_t)(sizeof(e1_b1_occ) / sizeof(e1_b1_occ[0])),
+                           ox, oy, scale_q10, occ_red, (uint8_t)occ_line_w);
+    track_make_scaled_line(track_e1_block_occ_layer[1], p_b2_occ_0, e1_b2_occ_0,
+                           (uint16_t)(sizeof(e1_b2_occ_0) / sizeof(e1_b2_occ_0[0])),
+                           ox, oy, scale_q10, occ_red, (uint8_t)occ_line_w);
+    track_make_scaled_line(track_e1_block_occ_layer[1], p_b2_occ_1, e1_b2_occ_1,
+                           (uint16_t)(sizeof(e1_b2_occ_1) / sizeof(e1_b2_occ_1[0])),
+                           ox, oy, scale_q10, occ_red, (uint8_t)occ_line_w);
+    track_make_scaled_line(track_e1_block_occ_layer[1], p_b2_occ_2, e1_b2_occ_2,
+                           (uint16_t)(sizeof(e1_b2_occ_2) / sizeof(e1_b2_occ_2[0])),
+                           ox, oy, scale_q10, occ_red, (uint8_t)occ_line_w);
+    track_make_scaled_line(track_e1_block_occ_layer[1], p_b2_occ_3, e1_b2_occ_3,
+                           (uint16_t)(sizeof(e1_b2_occ_3) / sizeof(e1_b2_occ_3[0])),
+                           ox, oy, scale_q10, occ_red, (uint8_t)occ_line_w);
+    track_make_scaled_line(track_e1_block_occ_layer[1], p_b2_occ_4, e1_b2_occ_4,
+                           (uint16_t)(sizeof(e1_b2_occ_4) / sizeof(e1_b2_occ_4[0])),
+                           ox, oy, scale_q10, occ_red, (uint8_t)occ_line_w);
+    track_make_scaled_line(track_e1_block_occ_layer[2], p_b3_occ, e1_b3_occ,
+                           (uint16_t)(sizeof(e1_b3_occ) / sizeof(e1_b3_occ[0])),
+                           ox, oy, scale_q10, occ_red, (uint8_t)occ_line_w);
+
+    // Weichen-Overlays fuer Ebene 1: W9, W10, W11.
+    // Jede Weiche hat genau zwei vorbereitete Layer: abbiegen und gerade.
+    // Spaeter wird nur der Layer passend zur Ist-Stellung sichtbar geschaltet.
+    // Gruen = Ist == Soll, Rot = Ist != Soll.
+    int turnout_line_w = occ_line_w;
+    if (turnout_line_w < 3) turnout_line_w = 3;
+    const uint32_t turnout_ok_green = 0x2ECC71;
+
+    for (uint8_t i = 0; i < 3; ++i) {
+        track_e1_turnout_layer[i][0] = track_make_overlay_layer(panel, panel_w, panel_h);
+        track_e1_turnout_layer[i][1] = track_make_overlay_layer(panel, panel_w, panel_h);
+        track_e1_turnout_warn_layer[i] = track_make_overlay_layer(panel, panel_w, panel_h);
+    }
+
+    // W9 abbiegen/gerade aus HMI_weiche_w9_a.svg / HMI_weiche_w9_g.svg
+    static const track_src_point_t e1_w9_a_0[] = { {836, 512}, {862, 538} };
+    static const track_src_point_t e1_w9_a_1[] = { {881, 552}, {917, 552} };
+    static const track_src_point_t e1_w9_g_0[] = { {819, 553}, {855, 553} };
+    static const track_src_point_t e1_w9_g_1[] = { {881, 553}, {917, 553} };
+
+    // W10 abbiegen/gerade aus HMI_weiche_w10_a.svg / HMI_weiche_w10_g.svg
+    static const track_src_point_t e1_w10_a_0[] = { {562, 154}, {588, 180} };
+    static const track_src_point_t e1_w10_a_1[] = { {609, 193}, {646, 193} };
+    static const track_src_point_t e1_w10_g_0[] = { {545, 193}, {582, 193} };
+    static const track_src_point_t e1_w10_g_1[] = { {609, 193}, {646, 193} };
+
+    // W11 abbiegen/gerade aus HMI_weiche_w11_a.svg / HMI_weiche_w11_g.svg
+    static const track_src_point_t e1_w11_a_0[] = { {452, 86}, {488, 86} };
+    static const track_src_point_t e1_w11_a_1[] = { {507, 99}, {533, 125} };
+    static const track_src_point_t e1_w11_g_0[] = { {452, 87}, {488, 87} };
+    static const track_src_point_t e1_w11_g_1[] = { {514, 86}, {550, 86} };
+
+    static lv_point_t p_w9_a_0[2], p_w9_a_1[2], p_w9_g_0[2], p_w9_g_1[2];
+    static lv_point_t p_w10_a_0[2], p_w10_a_1[2], p_w10_g_0[2], p_w10_g_1[2];
+    static lv_point_t p_w11_a_0[2], p_w11_a_1[2], p_w11_g_0[2], p_w11_g_1[2];
+
+    track_make_scaled_line(track_e1_turnout_layer[0][0], p_w9_a_0, e1_w9_a_0, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+    track_make_scaled_line(track_e1_turnout_layer[0][0], p_w9_a_1, e1_w9_a_1, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+    track_make_scaled_line(track_e1_turnout_layer[0][1], p_w9_g_0, e1_w9_g_0, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+    track_make_scaled_line(track_e1_turnout_layer[0][1], p_w9_g_1, e1_w9_g_1, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+
+    track_make_scaled_line(track_e1_turnout_layer[1][0], p_w10_a_0, e1_w10_a_0, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+    track_make_scaled_line(track_e1_turnout_layer[1][0], p_w10_a_1, e1_w10_a_1, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+    track_make_scaled_line(track_e1_turnout_layer[1][1], p_w10_g_0, e1_w10_g_0, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+    track_make_scaled_line(track_e1_turnout_layer[1][1], p_w10_g_1, e1_w10_g_1, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+
+    track_make_scaled_line(track_e1_turnout_layer[2][0], p_w11_a_0, e1_w11_a_0, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+    track_make_scaled_line(track_e1_turnout_layer[2][0], p_w11_a_1, e1_w11_a_1, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+    track_make_scaled_line(track_e1_turnout_layer[2][1], p_w11_g_0, e1_w11_g_0, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+    track_make_scaled_line(track_e1_turnout_layer[2][1], p_w11_g_1, e1_w11_g_1, 2, ox, oy, scale_q10, turnout_ok_green, (uint8_t)turnout_line_w);
+
+    // Warnsymbole fuer W9, W10, W11 aus den HMI_weiche_wX_warn.svg-Dateien.
+    // Sichtbarkeit wird spaeter nur ueber warningMask geschaltet.
+    int warn_line_w = (int)((10 * scale_q10) / 1024);
+    if (warn_line_w < 4) warn_line_w = 4;
+    if (warn_line_w > 9) warn_line_w = 9;
+    const uint32_t warn_red = 0xFF0000;
+
+    static const track_src_point_t e1_w9_warn[] = {
+        {908, 502}, {890, 533}, {871, 502}, {908, 502}
+    };
+    static const track_src_point_t e1_w10_warn[] = {
+        {634, 143}, {615, 173}, {596, 143}, {634, 143}
+    };
+    static const track_src_point_t e1_w11_warn[] = {
+        {492, 107}, {473, 137}, {455, 107}, {492, 107}
+    };
+
+    static lv_point_t p_w9_warn[4], p_w10_warn[4], p_w11_warn[4];
+    track_make_scaled_warn_triangle(track_e1_turnout_warn_layer[0], p_w9_warn, e1_w9_warn,
+                                    ox, oy, scale_q10, warn_red, (uint8_t)warn_line_w);
+    track_make_scaled_warn_triangle(track_e1_turnout_warn_layer[1], p_w10_warn, e1_w10_warn,
+                                    ox, oy, scale_q10, warn_red, (uint8_t)warn_line_w);
+    track_make_scaled_warn_triangle(track_e1_turnout_warn_layer[2], p_w11_warn, e1_w11_warn,
+                                    ox, oy, scale_q10, warn_red, (uint8_t)warn_line_w);
+
+    // Signale Ebene 1: Blockfreigaben und Bahnhofs-Ausfahrten.
+    // Die SVGs werden nicht als Bild geladen; verwendet werden nur die Positionen.
+    // Darstellung:
+    //   freigegeben       -> unten gruen
+    //   nicht freigegeben -> oben rot
+    //   unbekannt/offline -> beide grau
+    int sig_d = (int)((15 * scale_q10) / 1024);
+    if (sig_d < 8) sig_d = 8;
+    if (sig_d > 15) sig_d = 15;
+    const int sig_pad = 4;
+
+    typedef struct {
+        uint16_t x;
+        uint16_t top_y;
+        uint16_t bottom_y;
+    } track_signal_pos_t;
+
+    static const track_signal_pos_t e1_signal_pos[4] = {
+        {419, 241, 258}, // Grant Block 1 -> Block 2, aus grant_1_2_green.svg
+        {529, 239, 256}, // Grant Block 2 -> Block 3, aus grant_2_3_green.svg
+        {254, 456, 472}, // Bhf2, aus bhf2_green.svg
+        {643, 267, 283}, // Bhf3, aus bhf3_green.svg
+    };
+
+    for (uint8_t i = 0; i < 4; ++i) {
+        const int sig_x = ox + (e1_signal_pos[i].x * scale_q10) / 1024;
+        const int sig_top_y = oy + (e1_signal_pos[i].top_y * scale_q10) / 1024;
+        const int sig_bottom_y = oy + (e1_signal_pos[i].bottom_y * scale_q10) / 1024;
+        const int sig_box_x = sig_x - sig_d / 2 - sig_pad;
+        const int sig_box_y = sig_top_y - sig_d / 2 - sig_pad;
+        const int sig_box_w = sig_d + 2 * sig_pad;
+        const int sig_box_h = (sig_bottom_y - sig_top_y) + sig_d + 2 * sig_pad;
+        track_e1_signal_box[i] = track_make_signal_box(panel, sig_box_x, sig_box_y, sig_box_w, sig_box_h);
+        track_e1_signal_red[i] = track_make_signal_dot(panel, sig_x, sig_top_y, sig_d, 0x555555);
+        track_e1_signal_green[i] = track_make_signal_dot(panel, sig_x, sig_bottom_y, sig_d, 0x555555);
+    }
+
+    // Grosszuegige transparente Touch-Hitboxen fuer Ebene 1.
+    // Die sichtbaren Gleis-/Signalobjekte bleiben rein statisch; die Hitboxen
+    // senden die gleichen Commands wie die bestehenden Tabs.
+    // Reihenfolge: W9, W10, W11 sowie Bhf2, Bhf3.
+    typedef struct {
+        uint16_t x;
+        uint16_t y;
+        uint16_t w;
+        uint16_t h;
+        uint8_t idx;
+    } track_hitbox_pos_t;
+
+    static const track_hitbox_pos_t turnout_hitboxes[3] = {
+        {790, 490, 160, 100, 9},   // W9
+        {525, 130, 145, 100, 10},  // W10
+        {435,  62, 140, 100, 11},  // W11
+    };
+    static const track_hitbox_pos_t station_hitboxes[2] = {
+        {220, 430,  90,  90, 2},   // Bhf2
+        {610, 240,  90,  90, 3},   // Bhf3
+    };
+
+    for (uint8_t i = 0; i < 3; ++i) {
+        const int hx = ox + (turnout_hitboxes[i].x * scale_q10) / 1024;
+        const int hy = oy + (turnout_hitboxes[i].y * scale_q10) / 1024;
+        const int hw = (turnout_hitboxes[i].w * scale_q10) / 1024;
+        const int hh = (turnout_hitboxes[i].h * scale_q10) / 1024;
+        track_e1_hitbox_turnout[i] = track_make_hitbox(panel, hx, hy, hw, hh,
+                                                       on_left_m1_turnout_clicked,
+                                                       (void *)(uintptr_t)turnout_hitboxes[i].idx);
+    }
+    for (uint8_t i = 0; i < 2; ++i) {
+        const int hx = ox + (station_hitboxes[i].x * scale_q10) / 1024;
+        const int hy = oy + (station_hitboxes[i].y * scale_q10) / 1024;
+        const int hw = (station_hitboxes[i].w * scale_q10) / 1024;
+        const int hh = (station_hitboxes[i].h * scale_q10) / 1024;
+        track_e1_hitbox_station[i] = track_make_hitbox(panel, hx, hy, hw, hh,
+                                                       on_left_station_clicked,
+                                                       (void *)(uintptr_t)station_hitboxes[i].idx);
+    }
+}
+
 static void create_left_panel_tabs(lv_obj_t *left_panel, int left_w)
 {
     lv_obj_t *title = lv_label_create(left_panel);
@@ -1904,15 +2442,18 @@ static void create_left_panel_tabs(lv_obj_t *left_panel, int left_w)
     lv_obj_t *tab_weichen = lv_tabview_add_tab(left_tabview, "Weichen");
     lv_obj_t *tab_bahnhoefe = lv_tabview_add_tab(left_tabview, "Bahnhoefe");
     lv_obj_t *tab_bloecke = lv_tabview_add_tab(left_tabview, "Bloecke");
+    lv_obj_t *tab_gleisbild = lv_tabview_add_tab(left_tabview, "Gleisbild");
     lv_obj_t *tab_debug = lv_tabview_add_tab(left_tabview, "Debug");
 
     lv_obj_set_style_bg_color(tab_weichen, lv_color_hex(0x2B3942), 0);
     lv_obj_set_style_bg_color(tab_bahnhoefe, lv_color_hex(0x2B3942), 0);
     lv_obj_set_style_bg_color(tab_bloecke, lv_color_hex(0x2B3942), 0);
+    lv_obj_set_style_bg_color(tab_gleisbild, lv_color_hex(0x2B3942), 0);
     lv_obj_set_style_bg_color(tab_debug, lv_color_hex(0xF3EFE3), 0);
     lv_obj_clear_flag(tab_weichen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(tab_bahnhoefe, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(tab_bloecke, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_gleisbild, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *m1_panel = lv_obj_create(tab_weichen);
     lv_obj_set_size(m1_panel, left_w - 58, 282);
@@ -2054,6 +2595,8 @@ static void create_left_panel_tabs(lv_obj_t *left_panel, int left_w)
         left_block_grant_green[i] = ui_make_signal_led(grant_panel, x + 160, y + 4, 0x555555);
     }
 
+    create_track_tab_ebene1_start(tab_gleisbild, left_w);
+
     lv_obj_t *debug_title = lv_label_create(tab_debug);
     lv_label_set_text(debug_title, "Kommunikation");
     ui_label_style(debug_title, &lv_font_montserrat_24, 0x333333);
@@ -2149,6 +2692,101 @@ static int left_grant_display_state(const hmi_state_t *s, uint8_t display_idx)
     }
 }
 
+static void update_track_e1_occ_ui(const hmi_state_t *s)
+{
+    if (!s) return;
+
+    const bool occ_valid = s->mega2_online && s->mega2_block_occ_valid;
+    for (uint8_t i = 0; i < 3; ++i) {
+        lv_obj_t *layer = track_e1_block_occ_layer[i];
+        if (!layer) continue;
+
+        // Ebene 1 zeigt Block 1, Block 2 und Block 3.
+        // Bei frei oder fehlender Information wird keine rote Linie dargestellt.
+        const bool occupied = occ_valid && ((s->mega2_block_occ_mask & (1u << i)) != 0u);
+        if (occupied) lv_obj_clear_flag(layer, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(layer, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+
+static bool track_mega1_defect_text_mentions_turnout(const hmi_state_t *s, uint8_t id)
+{
+    if (!s || s->mega1_defects[0] == ' ') return false;
+    switch (id) {
+        case 9:  return strstr(s->mega1_defects, "W9")  != NULL;
+        case 10: return strstr(s->mega1_defects, "W10") != NULL;
+        case 11: return strstr(s->mega1_defects, "W11") != NULL;
+        default: return false;
+    }
+}
+
+static void update_track_e1_turnouts_ui(const hmi_state_t *s)
+{
+    if (!s) return;
+
+    // Ebene 1 zeigt aktuell die Mega1-Weichen W9, W10, W11.
+    // Bit gesetzt bedeutet wie im bestehenden Weichen-Tab: gerade.
+    // Es gibt derzeit keinen undef-Zustand; bei Mega1 offline blenden wir aus.
+    static const uint8_t turnout_ids[3] = { 9, 10, 11 };
+    const bool valid = s->mega1_online;
+
+    for (uint8_t i = 0; i < 3; ++i) {
+        const uint8_t id = turnout_ids[i];
+        const bool ist_gerade = ((s->mega1_weiche_ist_bits & (1u << id)) != 0u);
+        const bool soll_gerade = ((s->mega1_weiche_soll_bits & (1u << id)) != 0u);
+        const bool mismatch = (ist_gerade != soll_gerade);
+        const uint32_t color = mismatch ? 0xF25F4C : 0x2ECC71;
+        const bool warn = valid && (((s->mega1_warning_mask & (1u << id)) != 0u) ||
+                                    track_mega1_defect_text_mentions_turnout(s, id));
+
+        lv_obj_t *layer_a = track_e1_turnout_layer[i][0];
+        lv_obj_t *layer_g = track_e1_turnout_layer[i][1];
+        lv_obj_t *layer_warn = track_e1_turnout_warn_layer[i];
+
+        if (layer_a) {
+            track_set_layer_color(layer_a, color);
+            if (valid && !ist_gerade) lv_obj_clear_flag(layer_a, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(layer_a, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (layer_g) {
+            track_set_layer_color(layer_g, color);
+            if (valid && ist_gerade) lv_obj_clear_flag(layer_g, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(layer_g, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (layer_warn) {
+            if (warn) lv_obj_clear_flag(layer_warn, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(layer_warn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void update_track_e1_grants_ui(const hmi_state_t *s)
+{
+    if (!s) return;
+
+    // Ebene 1 Signal 0/1: Blockfreigaben 1->2 und 2->3.
+    // Die Bitbelegung entspricht der vorhandenen linken Blockfreigabe-Liste:
+    // display_idx 0 = SignalGrantMask Bit 0, display_idx 1 = Bit 1.
+    for (uint8_t i = 0; i < 2; ++i) {
+        int state = -1;
+        if (s->mega2_online && s->mega2_signal_grant_valid) {
+            state = (s->mega2_signal_grant_mask & (1u << i)) ? 1 : 0;
+        }
+        track_set_grant_signal(track_e1_signal_red[i], track_e1_signal_green[i], state);
+    }
+
+    // Ebene 1 Signal 2/3: Bahnhofs-Ausfahrten Bhf2/Bhf3.
+    for (uint8_t i = 0; i < 2; ++i) {
+        const uint8_t bhf_id = (uint8_t)(i + 2);
+        int state = -1;
+        if (s->mega1_online && s->mega1_bahnhof_valid) {
+            state = (s->mega1_bahnhof_mask & (1u << bhf_id)) ? 1 : 0;
+        }
+        track_set_grant_signal(track_e1_signal_red[i + 2], track_e1_signal_green[i + 2], state);
+    }
+}
+
 static void update_left_panel_ui(const hmi_state_t *s)
 {
     if (!s) return;
@@ -2234,6 +2872,10 @@ static void update_left_panel_ui(const hmi_state_t *s)
 
         left_set_dual_led(left_block_grant_red[i], left_block_grant_green[i], left_grant_display_state(s, (uint8_t)i));
     }
+
+    update_track_e1_occ_ui(s);
+    update_track_e1_turnouts_ui(s);
+    update_track_e1_grants_ui(s);
 
     if (left_debug_summary_label) {
         char buf[160];
