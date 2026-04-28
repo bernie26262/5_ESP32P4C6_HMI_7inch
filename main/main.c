@@ -838,6 +838,20 @@ static void hmi_state_update_from_json(const char *payload, uint32_t len)
                 g_state.mega2_signal_grant_valid = true;
             }
 
+            const cJSON *entry_allowed = json_get_path(root, "mega2", "entryAllowed");
+            if (cJSON_IsArray(entry_allowed)) {
+                memset(g_state.mega2_entry_allowed, 0, sizeof(g_state.mega2_entry_allowed));
+                const int n = cJSON_GetArraySize(entry_allowed);
+                const int max_n = (n < 9) ? n : 9;
+                for (int i = 0; i < max_n; ++i) {
+                    const cJSON *item = cJSON_GetArrayItem(entry_allowed, i);
+                    if (cJSON_IsNumber(item)) {
+                        g_state.mega2_entry_allowed[i] = (uint16_t)(((uint32_t)item->valuedouble) & 0x01FFu);
+                    }
+                }
+                g_state.mega2_entry_allowed_valid = true;
+            }
+
             if (json_try_get_u32_path3(root, "mega2", "sbhf", "state", &u32)) {
                 g_state.mega2_sbhf_state = (uint8_t)(u32 & 0xFFu);
             }
@@ -3528,15 +3542,22 @@ static void update_track_e0_turnouts_ui(const hmi_state_t *s)
 static int track_entry_allowed_state(const hmi_state_t *s, uint8_t from, uint8_t to)
 {
     if (!s || !s->mega2_online) return -1;
-    if (s->mega2_entry_allowed_valid) {
-        return (s->mega2_entry_allowed[from] & (1u << to)) ? 1 : 0;
+
+    // ETH/WebUI entryAllowed ist 0-basiert abgelegt:
+    // entryAllowed[2] Bit 3 = 3->4, entryAllowed[3] Bit 0 = 4->1 usw.
+    if (s->mega2_entry_allowed_valid && from >= 1u && from <= 9u && to >= 1u && to <= 9u) {
+        const uint8_t row = (uint8_t)(from - 1u);
+        const uint8_t bit = (uint8_t)(to - 1u);
+        return (s->mega2_entry_allowed[row] & (1u << bit)) ? 1 : 0;
     }
+
     // Fallback fuer HMI-state-lite, falls entryAllowed nicht mitgesendet wird.
     // Die bekannten SignalGrantMask-Bits bleiben so weiter nutzbar.
     if (!s->mega2_signal_grant_valid) return -1;
     if (from == 3u && to == 4u) return (s->mega2_signal_grant_mask & (1u << 2)) ? 1 : 0;
     if (from == 6u && to == 4u) return (s->mega2_signal_grant_mask & (1u << 11)) ? 1 : 0;
     if (from == 4u && to == 5u) return (s->mega2_signal_grant_mask & (1u << 4)) ? 1 : 0;
+    if (from == 4u && to == 1u) return 0;
     return -1;
 }
 
