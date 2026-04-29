@@ -9,6 +9,9 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_err.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 #include "driver/uart.h"
 
@@ -132,10 +135,19 @@ static hmi_rx_state_t g_rx_state = RX_WAIT_SYNC1;
 static uint16_t g_expected_len = 0;
 static uint16_t g_pos = 0;
 
-static lv_obj_t *touch_label = NULL;
 static lv_obj_t *uart_status_label = NULL;
 static lv_obj_t *comm_status_label = NULL;
-static lv_obj_t *frame_status_label = NULL;
+
+static lv_obj_t *settings_brightness_label = NULL;
+static lv_obj_t *settings_brightness_slider = NULL;
+static lv_obj_t *settings_timeout_dropdown = NULL;
+static lv_obj_t *screen_off_wake_overlay = NULL;
+static lv_indev_t *g_touch_indev = NULL;
+static lv_timer_t *display_power_timer = NULL;
+static int g_display_brightness_percent = 70;
+static uint32_t g_screen_off_timeout_sec = 120;
+static uint32_t g_last_user_activity_ms = 0;
+static bool g_screen_off = false;
 
 // Right panel elements (new)
 static lv_obj_t *power_led = NULL;
@@ -267,6 +279,10 @@ static uint32_t g_auto_led_bg_cache = 0xFFFFFFFFu;
 
 static bool snapshot_emergency_overlay_active(const hmi_state_t *s);
 static void update_left_panel_ui(const hmi_state_t *s);
+static void display_settings_load(void);
+static void display_settings_save(void);
+static void display_apply_brightness(void);
+static void display_note_user_activity(bool from_touch);
 
 static const cJSON *json_get_path(const cJSON *root, const char *a, const char *b)
 {
@@ -1077,17 +1093,216 @@ static void hmi_uart_init(void)
     xTaskCreate(hmi_uart_rx_task, "hmi_uart_rx", 8192, NULL, 10, NULL);
 }
 
-static void touch_event_cb(lv_event_t *e)
+static uint32_t timeout_dropdown_to_sec(uint16_t sel)
 {
-    lv_indev_t *indev = lv_indev_get_act();
-    if (!indev || !touch_label) return;
+    switch (sel) {
+        case 0: return 0;
+        case 1: return 30;
+        case 2: return 60;
+        case 3: return 120;
+        case 4: return 300;
+        case 5: return 600;
+        default: return 120;
+    }
+}
 
-    lv_point_t p;
-    lv_indev_get_point(indev, &p);
+static uint16_t timeout_sec_to_dropdown(uint32_t sec)
+{
+    if (sec == 0) return 0;
+    if (sec <= 30) return 1;
+    if (sec <= 60) return 2;
+    if (sec <= 120) return 3;
+    if (sec <= 300) return 4;
+    return 5;
+}
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "Touch: x=%ld y=%ld", (long)p.x, (long)p.y);
-    lv_label_set_text(touch_label, buf);
+static void display_settings_load(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("hmi_settings", NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        g_display_brightness_percent = 70;
+        g_screen_off_timeout_sec = 120;
+        return;
+    }
+
+    int32_t brightness = g_display_brightness_percent;
+    uint32_t timeout_sec = g_screen_off_timeout_sec;
+    (void)nvs_get_i32(h, "brightness", &brightness);
+    (void)nvs_get_u32(h, "screen_off", &timeout_sec);
+    nvs_close(h);
+
+    if (brightness < 10) brightness = 10;
+    if (brightness > 100) brightness = 100;
+    g_display_brightness_percent = (int)brightness;
+
+    switch (timeout_sec) {
+        case 0:
+        case 30:
+        case 60:
+        case 120:
+        case 300:
+        case 600:
+            g_screen_off_timeout_sec = timeout_sec;
+            break;
+        default:
+            g_screen_off_timeout_sec = 120;
+            break;
+    }
+}
+
+static void display_settings_save(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("hmi_settings", NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS open hmi_settings failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    (void)nvs_set_i32(h, "brightness", g_display_brightness_percent);
+    (void)nvs_set_u32(h, "screen_off", g_screen_off_timeout_sec);
+    (void)nvs_commit(h);
+    nvs_close(h);
+}
+
+static void update_settings_labels(void)
+{
+    if (settings_brightness_label) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Helligkeit: %d %%", g_display_brightness_percent);
+        lv_label_set_text(settings_brightness_label, buf);
+    }
+
+    if (settings_timeout_dropdown) {
+        lv_dropdown_set_selected(settings_timeout_dropdown, timeout_sec_to_dropdown(g_screen_off_timeout_sec));
+    }
+}
+
+static void display_apply_brightness(void)
+{
+    int brightness = g_display_brightness_percent;
+    if (brightness < 10) brightness = 10;
+    if (brightness > 100) brightness = 100;
+    g_display_brightness_percent = brightness;
+
+    if (!g_screen_off) {
+        esp_err_t err = bsp_display_brightness_set(brightness);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "brightness_set(%d) failed: %s", brightness, esp_err_to_name(err));
+        }
+    }
+}
+
+static void screen_off_overlay_set_visible(bool visible)
+{
+    if (!screen_off_wake_overlay) return;
+    if (visible) {
+        lv_obj_clear_flag(screen_off_wake_overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(screen_off_wake_overlay);
+    } else {
+        lv_obj_add_flag(screen_off_wake_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void display_screen_off_enter(void)
+{
+    if (g_screen_off) return;
+    g_screen_off = true;
+    screen_off_overlay_set_visible(true);
+    (void)bsp_display_brightness_set(0);
+}
+
+static void display_screen_wake(void)
+{
+    if (!g_screen_off) return;
+    g_screen_off = false;
+    display_apply_brightness();
+    screen_off_overlay_set_visible(false);
+}
+
+static void display_note_user_activity(bool from_touch)
+{
+    g_last_user_activity_ms = lv_tick_get();
+    if (from_touch && g_screen_off) {
+        display_screen_wake();
+    }
+}
+
+static void screen_off_wake_event_cb(lv_event_t *e)
+{
+    (void)e;
+    display_note_user_activity(true);
+}
+
+static void display_activity_event_cb(lv_event_t *e)
+{
+    (void)e;
+    // Jede normale Touch-Bedienung setzt den Screen-Off-Timer zurueck.
+    // Wenn der Screen bereits dunkel ist, faengt das Wake-Overlay den ersten
+    // Touch ab; normale Objekte sollen dann keine Anlagenaktion ausloesen.
+    if (!g_screen_off) {
+        display_note_user_activity(false);
+    }
+}
+
+static void display_attach_activity_recursive(lv_obj_t *obj)
+{
+    if (!obj) return;
+
+    if (obj != screen_off_wake_overlay) {
+        lv_obj_add_event_cb(obj, display_activity_event_cb, LV_EVENT_PRESSED, NULL);
+        lv_obj_add_event_cb(obj, display_activity_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    }
+
+    uint32_t child_count = lv_obj_get_child_cnt(obj);
+    for (uint32_t i = 0; i < child_count; ++i) {
+        display_attach_activity_recursive(lv_obj_get_child(obj, i));
+    }
+}
+
+static void settings_brightness_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (!settings_brightness_slider) return;
+
+    int v = (int)lv_slider_get_value(settings_brightness_slider);
+    if (v < 10) v = 10;
+    if (v > 100) v = 100;
+    g_display_brightness_percent = v;
+    update_settings_labels();
+    display_apply_brightness();
+    display_note_user_activity(true);
+
+    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        display_settings_save();
+    }
+}
+
+static void settings_timeout_event_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!settings_timeout_dropdown) return;
+
+    uint16_t sel = lv_dropdown_get_selected(settings_timeout_dropdown);
+    g_screen_off_timeout_sec = timeout_dropdown_to_sec(sel);
+    display_note_user_activity(true);
+    display_settings_save();
+}
+
+static void display_power_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (g_screen_off || g_screen_off_timeout_sec == 0) {
+        return;
+    }
+
+    const uint32_t now = lv_tick_get();
+    const uint32_t timeout_ms = g_screen_off_timeout_sec * 1000u;
+    if ((uint32_t)(now - g_last_user_activity_ms) >= timeout_ms) {
+        display_screen_off_enter();
+    }
 }
 
 static const char *yesno(bool v)
@@ -1857,9 +2072,9 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
         snprintf(msg_buf, sizeof(msg_buf),
             "%s%s%s%s%sSBHF erlaubte Gleise: %s",
             s.ack_required ? "ACK erforderlich\n" : "",
-            s.sbhf_restricted ? "SBHF: Restricted Mode aktiv\n" : "",
             has_m1_defect ? "Mega1: Eine oder mehrere Weichen schalten nicht in die Sollstellung.\n" : "",
             has_m2_defect ? "SBHF: Eine oder mehrere Weichen melden Stoerung/Defekt.\n" : "",
+            s.sbhf_restricted ? "SBHF: Restricted Mode aktiv\n" : "",
             has_message ? "" : "Keine Meldungen\n",
             s.sbhf_allowed_text[0] ? s.sbhf_allowed_text : "-"
         );
@@ -3131,13 +3346,13 @@ static void create_left_panel_tabs(lv_obj_t *left_panel, int left_w)
     lv_obj_t *tab_bahnhoefe = lv_tabview_add_tab(left_tabview, "Bahnhoefe");
     lv_obj_t *tab_bloecke = lv_tabview_add_tab(left_tabview, "Bloecke");
     lv_obj_t *tab_gleisbild = lv_tabview_add_tab(left_tabview, "Gleisbild");
-    lv_obj_t *tab_debug = lv_tabview_add_tab(left_tabview, "Debug");
+    lv_obj_t *tab_settings = lv_tabview_add_tab(left_tabview, "Einstellungen");
 
     lv_obj_set_style_bg_color(tab_weichen, lv_color_hex(0x2B3942), 0);
     lv_obj_set_style_bg_color(tab_bahnhoefe, lv_color_hex(0x2B3942), 0);
     lv_obj_set_style_bg_color(tab_bloecke, lv_color_hex(0x2B3942), 0);
     lv_obj_set_style_bg_color(tab_gleisbild, lv_color_hex(0x2B3942), 0);
-    lv_obj_set_style_bg_color(tab_debug, lv_color_hex(0xF3EFE3), 0);
+    lv_obj_set_style_bg_color(tab_settings, lv_color_hex(0xF3EFE3), 0);
     lv_obj_clear_flag(tab_weichen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(tab_bahnhoefe, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(tab_bloecke, LV_OBJ_FLAG_SCROLLABLE);
@@ -3291,60 +3506,81 @@ static void create_left_panel_tabs(lv_obj_t *left_panel, int left_w)
     track_switch_level(TRACK_LEVEL_SBHF);
     lv_tabview_set_act(left_tabview, 3, LV_ANIM_OFF);
 
-    lv_obj_t *debug_title = lv_label_create(tab_debug);
-    lv_label_set_text(debug_title, "Kommunikation");
-    ui_label_style(debug_title, &lv_font_montserrat_24, 0x333333);
-    lv_obj_align(debug_title, LV_ALIGN_TOP_LEFT, 12, 10);
+    lv_obj_t *settings_title = lv_label_create(tab_settings);
+    lv_label_set_text(settings_title, "Einstellungen");
+    ui_label_style(settings_title, &lv_font_montserrat_24, 0x333333);
+    lv_obj_align(settings_title, LV_ALIGN_TOP_LEFT, 12, 10);
 
-    left_debug_summary_label = lv_label_create(tab_debug);
-    lv_label_set_text(left_debug_summary_label, "Debug kompakt: RX/TX, ACK, Parser und Frame-Typen.");
+    lv_obj_t *display_panel = lv_obj_create(tab_settings);
+    lv_obj_set_size(display_panel, left_w - 65, 220);
+    lv_obj_align(display_panel, LV_ALIGN_TOP_LEFT, 12, 48);
+    ui_card_style(display_panel, 0x17313A);
+
+    lv_obj_t *display_title = lv_label_create(display_panel);
+    lv_label_set_text(display_title, "Display");
+    ui_label_style(display_title, &lv_font_montserrat_18, 0xFFFFFF);
+    lv_obj_align(display_title, LV_ALIGN_TOP_LEFT, 12, 8);
+
+    settings_brightness_label = lv_label_create(display_panel);
+    lv_label_set_text(settings_brightness_label, "Helligkeit: 70 %");
+    ui_label_style(settings_brightness_label, &lv_font_montserrat_16, 0xFFFFFF);
+    lv_obj_align(settings_brightness_label, LV_ALIGN_TOP_LEFT, 12, 40);
+
+    settings_brightness_slider = lv_slider_create(display_panel);
+    lv_obj_set_size(settings_brightness_slider, left_w - 115, 24);
+    lv_obj_align(settings_brightness_slider, LV_ALIGN_TOP_LEFT, 12, 70);
+    lv_slider_set_range(settings_brightness_slider, 10, 100);
+    lv_slider_set_value(settings_brightness_slider, g_display_brightness_percent, LV_ANIM_OFF);
+    lv_obj_add_event_cb(settings_brightness_slider, settings_brightness_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(settings_brightness_slider, settings_brightness_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(settings_brightness_slider, settings_brightness_event_cb, LV_EVENT_PRESS_LOST, NULL);
+
+    lv_obj_t *timeout_label = lv_label_create(display_panel);
+    lv_label_set_text(timeout_label, "Screen-Off nach Inaktivitaet");
+    ui_label_style(timeout_label, &lv_font_montserrat_16, 0xFFFFFF);
+    lv_obj_align(timeout_label, LV_ALIGN_TOP_LEFT, 12, 112);
+
+    settings_timeout_dropdown = lv_dropdown_create(display_panel);
+    lv_dropdown_set_options(settings_timeout_dropdown, "Aus\n30 s\n1 min\n2 min\n5 min\n10 min");
+    lv_dropdown_set_selected(settings_timeout_dropdown, timeout_sec_to_dropdown(g_screen_off_timeout_sec));
+    lv_obj_set_size(settings_timeout_dropdown, 220, 42);
+    lv_obj_align(settings_timeout_dropdown, LV_ALIGN_TOP_LEFT, 12, 144);
+    lv_obj_add_event_cb(settings_timeout_dropdown, settings_timeout_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *hint = lv_label_create(tab_settings);
+    lv_label_set_text(hint,
+                      "Screen-Off schaltet nur die Hintergrundbeleuchtung aus.\n"
+                      "LVGL, UART und die Statusverarbeitung laufen weiter.\n"
+                      "Der erste Touch bei dunklem Display weckt nur auf und loest keine Anlagenaktion aus.");
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, left_w - 65);
+    ui_label_style(hint, &lv_font_montserrat_16, 0x333333);
+    lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 12, 282);
+
+    lv_obj_t *comm_panel = lv_obj_create(tab_settings);
+    lv_obj_set_size(comm_panel, left_w - 65, 190);
+    lv_obj_align(comm_panel, LV_ALIGN_TOP_LEFT, 12, 372);
+    ui_card_style(comm_panel, 0x20333C);
+
+    lv_obj_t *comm_title = lv_label_create(comm_panel);
+    lv_label_set_text(comm_title, "Kommunikation kompakt");
+    ui_label_style(comm_title, &lv_font_montserrat_16, 0xFFFFFF);
+    lv_obj_align(comm_title, LV_ALIGN_TOP_LEFT, 12, 8);
+
+    left_debug_summary_label = lv_label_create(comm_panel);
+    lv_label_set_text(left_debug_summary_label, "RX/TX, ACK und Frame-Typen kompakt.");
     lv_label_set_long_mode(left_debug_summary_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(left_debug_summary_label, left_w - 65);
-    ui_label_style(left_debug_summary_label, &lv_font_montserrat_14, 0x333333);
-    lv_obj_align(left_debug_summary_label, LV_ALIGN_TOP_LEFT, 12, 40);
+    lv_obj_set_width(left_debug_summary_label, left_w - 105);
+    ui_label_style(left_debug_summary_label, &lv_font_montserrat_14, 0xFFFFFF);
+    lv_obj_align(left_debug_summary_label, LV_ALIGN_TOP_LEFT, 12, 34);
 
-    uart_status_label = lv_label_create(tab_debug);
-    lv_label_set_text(uart_status_label, "UART RX: waiting...");
-    lv_label_set_long_mode(uart_status_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(uart_status_label, left_w - 65);
-    ui_label_style(uart_status_label, &lv_font_montserrat_16, 0x333333);
-    lv_obj_align(uart_status_label, LV_ALIGN_TOP_LEFT, 12, 74);
+    comm_status_label = lv_label_create(comm_panel);
+    lv_label_set_text(comm_status_label, "state-lite: 0 | analog: 0 | other: 0");
+    ui_label_style(comm_status_label, &lv_font_montserrat_14, 0xFFFFFF);
+    lv_obj_align(comm_status_label, LV_ALIGN_TOP_LEFT, 12, 88);
 
-    lv_obj_t *frame_panel = lv_obj_create(tab_debug);
-    lv_obj_set_size(frame_panel, 255, 142);
-    lv_obj_align(frame_panel, LV_ALIGN_TOP_LEFT, 12, 145);
-    ui_card_style(frame_panel, 0x17313A);
+    update_settings_labels();
 
-    lv_obj_t *frame_title = lv_label_create(frame_panel);
-    lv_label_set_text(frame_title, "Frame-Typen");
-    ui_label_style(frame_title, &lv_font_montserrat_16, 0xFFFFFF);
-    lv_obj_align(frame_title, LV_ALIGN_TOP_LEFT, 12, 8);
-
-    comm_status_label = lv_label_create(frame_panel);
-    lv_label_set_text(comm_status_label, "state-lite: 0\nanalog:     0\nother:      0");
-    ui_label_style(comm_status_label, &lv_font_montserrat_16, 0xFFFFFF);
-    lv_obj_align(comm_status_label, LV_ALIGN_TOP_LEFT, 12, 42);
-
-    lv_obj_t *touch_panel = lv_obj_create(tab_debug);
-    lv_obj_set_size(touch_panel, 255, 95);
-    lv_obj_align(touch_panel, LV_ALIGN_TOP_LEFT, 285, 145);
-    ui_card_style(touch_panel, 0x17313A);
-    lv_obj_add_event_cb(touch_panel, touch_event_cb, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(touch_panel, touch_event_cb, LV_EVENT_PRESSING, NULL);
-
-    touch_label = lv_label_create(touch_panel);
-    lv_label_set_text(touch_label, "Touch: -");
-    ui_label_style(touch_label, &lv_font_montserrat_16, 0xFFFFFF);
-    lv_obj_center(touch_label);
-
-    frame_status_label = lv_label_create(tab_debug);
-    lv_label_set_text(frame_status_label,
-                      "UART-Framing, JSON-Parser, State-Cache, ACK-Pfad und globales Dirty-Gating laufen.\n"
-                      "Roh-JSON wird nicht mehr angezeigt.");
-    lv_label_set_long_mode(frame_status_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(frame_status_label, left_w - 65);
-    ui_label_style(frame_status_label, &lv_font_montserrat_18, 0x333333);
-    lv_obj_align(frame_status_label, LV_ALIGN_TOP_LEFT, 12, 325);
 }
 
 static uint8_t left_block_occ_display_to_mask_bit(uint8_t display_idx)
@@ -3967,14 +4203,39 @@ static void create_hmi_screen(void)
     ui_label_style(messages_label, &lv_font_montserrat_12, 0x2ECC71);
     lv_obj_align(messages_label, LV_ALIGN_TOP_LEFT, 8, 30);
 
+    screen_off_wake_overlay = lv_obj_create(screen);
+    lv_obj_set_size(screen_off_wake_overlay, 1024, 600);
+    lv_obj_align(screen_off_wake_overlay, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_opa(screen_off_wake_overlay, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(screen_off_wake_overlay, 0, 0);
+    lv_obj_clear_flag(screen_off_wake_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(screen_off_wake_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(screen_off_wake_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(screen_off_wake_overlay, screen_off_wake_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(screen_off_wake_overlay, screen_off_wake_event_cb, LV_EVENT_CLICKED, NULL);
+
+    // Nach dem Aufbau aller sichtbaren UI-Objekte Aktivitaetserkennung
+    // registrieren. Damit setzt jede Beruehrung den Screen-Off-Timer zurueck.
+    display_attach_activity_recursive(screen);
+
     create_overlay_ui(screen);
 
+    g_last_user_activity_ms = lv_tick_get();
     lv_timer_create(uart_ui_timer_cb, 250, NULL);
+    display_power_timer = lv_timer_create(display_power_timer_cb, 500, NULL);
 }
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting Railway HMI P4 state-cache bring-up");
+
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+    display_settings_load();
 
     memset(&g_state, 0, sizeof(g_state));
     g_state_mutex = xSemaphoreCreateMutex();
@@ -3992,7 +4253,9 @@ void app_main(void)
     };
 
     lv_display_t *disp = bsp_display_start_with_config(&cfg);
-    bsp_display_backlight_on();
+    (void)bsp_display_brightness_init();
+    display_apply_brightness();
+    g_touch_indev = bsp_display_get_input_dev();
 
     if (disp != NULL) {
         bsp_display_rotate(disp, LV_DISPLAY_ROTATION_180);
