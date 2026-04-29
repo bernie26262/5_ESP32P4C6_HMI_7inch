@@ -165,7 +165,11 @@ static lv_obj_t *fault_m1_label = NULL;
 static lv_obj_t *fault_m2_label = NULL;
 static lv_obj_t *m1_retry_btn = NULL;
 static lv_obj_t *m2_retry_btn = NULL;
-static lv_obj_t *messages_label = NULL;
+static lv_obj_t *messages_ack_label = NULL;
+static lv_obj_t *messages_m1_label = NULL;
+static lv_obj_t *messages_sbhf_label = NULL;
+static lv_obj_t *messages_mode_label = NULL;
+static lv_obj_t *messages_allowed_label = NULL;
 
 static lv_obj_t *eth_value_label = NULL;
 static lv_obj_t *mega1_value_label = NULL;
@@ -2063,24 +2067,42 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
     ui_set_button_enabled(m1_retry_btn, snapshot_can_send_m1_retry(&s), 0x2D7FF9, 0x53616A);
     ui_set_button_enabled(m2_retry_btn, snapshot_can_send_m2_retry(&s), 0x2D7FF9, 0x53616A);
 
-    if (messages_label) {
+    if (messages_ack_label || messages_m1_label || messages_sbhf_label || messages_mode_label || messages_allowed_label) {
         const bool has_m1_defect = s.mega1_defects[0] != '\0';
         const bool has_m2_defect = s.mega2_defects[0] != '\0';
-        const bool has_message = s.ack_required || s.warning_present || has_m1_defect || has_m2_defect || s.sbhf_restricted;
+        
+        if (messages_ack_label) {
+            ui_label_set_text_if_changed(messages_ack_label, "ACK erforderlich");
+            ui_obj_set_hidden_if_changed(messages_ack_label, !s.ack_required);
+        }
 
-        char msg_buf[320];
-        snprintf(msg_buf, sizeof(msg_buf),
-            "%s%s%s%s%sSBHF erlaubte Gleise: %s",
-            s.ack_required ? "ACK erforderlich\n" : "",
-            has_m1_defect ? "Mega1: Eine oder mehrere Weichen schalten nicht in die Sollstellung.\n" : "",
-            has_m2_defect ? "SBHF: Eine oder mehrere Weichen melden Stoerung/Defekt.\n" : "",
-            s.sbhf_restricted ? "SBHF: Restricted Mode aktiv\n" : "",
-            has_message ? "" : "Keine Meldungen\n",
-            s.sbhf_allowed_text[0] ? s.sbhf_allowed_text : "-"
-        );
-        ui_label_set_text_if_changed(messages_label, msg_buf);
-        lv_obj_set_style_text_color(messages_label,
-            has_message ? lv_color_hex(0xF9D342) : lv_color_hex(0x2ECC71), 0);
+        if (messages_m1_label) {
+            ui_label_set_text_if_changed(messages_m1_label,
+                "Mega1: Eine oder mehrere Weichen schalten nicht in die Sollstellung.");
+            ui_obj_set_hidden_if_changed(messages_m1_label, !has_m1_defect);
+        }
+
+        if (messages_sbhf_label) {
+            ui_label_set_text_if_changed(messages_sbhf_label,
+                "SBHF: Eine oder mehrere Weichen melden Stoerung/Defekt.");
+            ui_obj_set_hidden_if_changed(messages_sbhf_label, !has_m2_defect);
+        }
+
+        if (messages_mode_label) {
+            ui_label_set_text_if_changed(messages_mode_label,
+                s.sbhf_restricted ? "SBHF: eingeschraenkter Betrieb aktiv" : "SBHF: normaler Betrieb");
+            lv_obj_set_style_text_color(messages_mode_label,
+                s.sbhf_restricted ? lv_color_hex(0xF9D342) : lv_color_hex(0x2ECC71), 0);
+            ui_obj_set_hidden_if_changed(messages_mode_label, false);
+        }
+
+        if (messages_allowed_label) {
+            char allowed_buf[64];
+            snprintf(allowed_buf, sizeof(allowed_buf), "SBHF erlaubte Gleise: %s",
+                     s.sbhf_allowed_text[0] ? s.sbhf_allowed_text : "-");
+            ui_label_set_text_if_changed(messages_allowed_label, allowed_buf);
+            ui_obj_set_hidden_if_changed(messages_allowed_label, false);
+        }
     }
 
     if (uart_status_label) {
@@ -4196,12 +4218,49 @@ static void create_hmi_screen(void)
     lv_obj_align_to(messages_card, fault_card, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 8);
     ui_card_style(messages_card, 0x20333C);
     ui_section_title(messages_card, "Meldungen", 8, 4);
-    messages_label = lv_label_create(messages_card);
-    lv_label_set_text(messages_label, "Keine Meldungen");
-    lv_label_set_long_mode(messages_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(messages_label, 248);
-    ui_label_style(messages_label, &lv_font_montserrat_12, 0x2ECC71);
-    lv_obj_align(messages_label, LV_ALIGN_TOP_LEFT, 8, 30);
+    
+    lv_obj_t *messages_box = lv_obj_create(messages_card);
+    lv_obj_set_size(messages_box, 248, 112);
+    lv_obj_align(messages_box, LV_ALIGN_TOP_LEFT, 8, 30);
+    lv_obj_set_style_bg_opa(messages_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(messages_box, 0, 0);
+    lv_obj_set_style_pad_all(messages_box, 0, 0);
+    lv_obj_set_style_pad_row(messages_box, 4, 0);
+    lv_obj_clear_flag(messages_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(messages_box, LV_FLEX_FLOW_COLUMN);
+
+    messages_ack_label = lv_label_create(messages_box);
+    lv_label_set_text(messages_ack_label, "ACK erforderlich");
+    lv_label_set_long_mode(messages_ack_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(messages_ack_label, 248);
+    ui_label_style(messages_ack_label, &lv_font_montserrat_12, 0xF9D342);
+    lv_obj_add_flag(messages_ack_label, LV_OBJ_FLAG_HIDDEN);
+
+    messages_m1_label = lv_label_create(messages_box);
+    lv_label_set_text(messages_m1_label, "Mega1: Eine oder mehrere Weichen schalten nicht in die Sollstellung.");
+    lv_label_set_long_mode(messages_m1_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(messages_m1_label, 248);
+    ui_label_style(messages_m1_label, &lv_font_montserrat_12, 0xFF4D4D);
+    lv_obj_add_flag(messages_m1_label, LV_OBJ_FLAG_HIDDEN);
+
+    messages_sbhf_label = lv_label_create(messages_box);
+    lv_label_set_text(messages_sbhf_label, "SBHF: Eine oder mehrere Weichen melden Stoerung/Defekt.");
+    lv_label_set_long_mode(messages_sbhf_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(messages_sbhf_label, 248);
+    ui_label_style(messages_sbhf_label, &lv_font_montserrat_12, 0xFF4D4D);
+    lv_obj_add_flag(messages_sbhf_label, LV_OBJ_FLAG_HIDDEN);
+
+    messages_mode_label = lv_label_create(messages_box);
+    lv_label_set_text(messages_mode_label, "SBHF: normaler Betrieb");
+    lv_label_set_long_mode(messages_mode_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(messages_mode_label, 248);
+    ui_label_style(messages_mode_label, &lv_font_montserrat_12, 0x2ECC71);
+
+    messages_allowed_label = lv_label_create(messages_box);
+    lv_label_set_text(messages_allowed_label, "SBHF erlaubte Gleise: -");
+    lv_label_set_long_mode(messages_allowed_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(messages_allowed_label, 248);
+    ui_label_style(messages_allowed_label, &lv_font_montserrat_12, 0xDDDDDD);
 
     screen_off_wake_overlay = lv_obj_create(screen);
     lv_obj_set_size(screen_off_wake_overlay, 1024, 600);
