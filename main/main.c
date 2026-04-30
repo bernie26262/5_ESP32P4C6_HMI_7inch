@@ -185,6 +185,8 @@ static lv_obj_t *left_station_cmd_status_label = NULL;
 static lv_obj_t *left_debug_summary_label = NULL;
 static lv_obj_t *left_m1_turnout_btns[12];
 static lv_obj_t *left_m1_turnout_labels[12];
+static lv_obj_t *left_click_flash_obj = NULL;
+static lv_timer_t *left_click_flash_timer = NULL;
 static lv_obj_t *left_sbhf_turnout_cards[4];
 static lv_obj_t *left_sbhf_turnout_labels[4];
 static lv_obj_t *left_station_cards[4];
@@ -648,6 +650,43 @@ static void left_set_clickable_feedback(lv_obj_t *obj, bool enabled)
         lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICKABLE);
     }
     lv_obj_set_style_text_opa(obj, LV_OPA_COVER, 0);
+}
+
+static void left_click_flash_hide_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (left_click_flash_obj) {
+        lv_obj_set_style_outline_width(left_click_flash_obj, 0, 0);
+        lv_obj_set_style_outline_opa(left_click_flash_obj, LV_OPA_TRANSP, 0);
+        left_click_flash_obj = NULL;
+    }
+    if (left_click_flash_timer) {
+        lv_timer_pause(left_click_flash_timer);
+    }
+}
+
+static void left_click_flash_pressed_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    if (!obj) return;
+
+    if (left_click_flash_obj && left_click_flash_obj != obj) {
+        lv_obj_set_style_outline_width(left_click_flash_obj, 0, 0);
+        lv_obj_set_style_outline_opa(left_click_flash_obj, LV_OPA_TRANSP, 0);
+    }
+
+    left_click_flash_obj = obj;
+    lv_obj_set_style_outline_color(obj, lv_color_white(), 0);
+    lv_obj_set_style_outline_opa(obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_outline_width(obj, 3, 0);
+    lv_obj_set_style_outline_pad(obj, 2, 0);
+
+    if (!left_click_flash_timer) {
+        left_click_flash_timer = lv_timer_create(left_click_flash_hide_cb, 220, NULL);
+    }
+    lv_timer_set_period(left_click_flash_timer, 220);
+    lv_timer_reset(left_click_flash_timer);
+    lv_timer_resume(left_click_flash_timer);
 }
 
 static void on_left_m1_turnout_clicked(lv_event_t *e)
@@ -3403,6 +3442,7 @@ static void create_left_panel_tabs(lv_obj_t *left_panel, int left_w)
         int y = 44 + row * 74;
         left_m1_turnout_btns[i] = ui_make_pill(m1_panel, "", x, y, 135, 60, 0x1F5361, 0xFFFFFF);
         left_m1_turnout_labels[i] = lv_obj_get_child(left_m1_turnout_btns[i], 0);
+        lv_obj_add_event_cb(left_m1_turnout_btns[i], left_click_flash_pressed_cb, LV_EVENT_PRESSED, NULL);
         lv_obj_add_event_cb(left_m1_turnout_btns[i], on_left_m1_turnout_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
         char buf[48];
         snprintf(buf, sizeof(buf), "W%d\nIst -- | Soll --", i);
@@ -3453,6 +3493,7 @@ static void create_left_panel_tabs(lv_obj_t *left_panel, int left_w)
         lv_obj_align(card, LV_ALIGN_TOP_LEFT, x, y);
         ui_card_style(card, 0x20333C);
         lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, left_click_flash_pressed_cb, LV_EVENT_PRESSED, NULL);
         lv_obj_add_event_cb(card, on_left_station_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
 
         lv_obj_t *label = lv_label_create(card);
@@ -4138,11 +4179,16 @@ static void create_hmi_screen(void)
     ui_section_title(right_panel, "Aktionen", 12, 8);
     power_led = ui_make_led(right_panel, 12, 49);
     power_on_btn = ui_make_button(right_panel, "Power On", 34, 31, 236, 42, 0x19B65A, 0xFFFFFF);
+    lv_obj_add_event_cb(power_on_btn, left_click_flash_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(power_on_btn, on_power_on_clicked, LV_EVENT_CLICKED, NULL);
+
     power_off_btn = ui_make_button(right_panel, "Power Off", 34, 80, 236, 42, 0xC83A32, 0xFFFFFF);
+    lv_obj_add_event_cb(power_off_btn, left_click_flash_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(power_off_btn, on_power_off_clicked, LV_EVENT_CLICKED, NULL);
+
     auto_led = ui_make_led(right_panel, 12, 147);
     auto_btn = ui_make_button(right_panel, "Auto", 34, 129, 236, 42, 0x00BCE3, 0xFFFFFF);
+    lv_obj_add_event_cb(auto_btn, left_click_flash_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(auto_btn, on_auto_clicked, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *trafo_card = lv_obj_create(right_panel);
