@@ -155,6 +155,7 @@ static lv_obj_t *auto_led = NULL;
 static lv_obj_t *power_on_btn = NULL;
 static lv_obj_t *power_off_btn = NULL;
 static lv_obj_t *auto_btn = NULL;
+static lv_obj_t *auto_reset_btn = NULL;
 
 static lv_obj_t *trafo_label = NULL;
 static lv_obj_t *write_label = NULL;
@@ -773,6 +774,21 @@ static void on_auto_clicked(lv_event_t *e)
     }
 }
 
+static void on_auto_reset_clicked(lv_event_t *e)
+{
+    (void)e;
+
+    bool can_send = false;
+    if (g_state_mutex && xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        can_send = g_state.can_write && g_state.auto_mode;
+        xSemaphoreGive(g_state_mutex);
+    }
+
+    if (can_send) {
+        hmi_uart_send_action("autoReset");
+    }
+}
+
 static void frame_parser_reset(void)
 {
     g_rx_state = RX_WAIT_SYNC1;
@@ -971,7 +987,20 @@ static void hmi_state_update_from_json(const char *payload, uint32_t len)
                 g_state.sbhf_allowed_mask = json_get_u32_path(root, "mega2", "allowedMask", g_state.sbhf_allowed_mask);
             }
             build_sbhf_allowed_text(g_state.sbhf_allowed_text, sizeof(g_state.sbhf_allowed_text), g_state.sbhf_allowed_mask);
-            g_state.sbhf_occupied_mask = (uint8_t)(json_get_u32_path3(root, "mega2", "sbhf", "occupiedMask", g_state.sbhf_occupied_mask) & 0x07u);
+
+            /* SBHF-Belegung robust lesen. Je nach ETH-State-Variante kommt sie als
+             * mega2.sbhf.occupiedMask, mega2.sbhf.occupiedMaskRaw oder flat als
+             * mega2.sbhfOccupiedMask. occupiedMaskRaw/flat enthalten ggf. Meta-Bits
+             * wie 0x80 (Selftest); fuer Anzeige/Overlay nur Gleise 1..3 nutzen.
+             */
+            uint32_t sbhf_occ_raw = g_state.sbhf_occupied_mask;
+            if (json_try_get_u32_path3(root, "mega2", "sbhf", "occupiedMask", &u32) ||
+                json_try_get_u32_path3(root, "mega2", "sbhf", "occupiedMaskRaw", &u32) ||
+                json_try_get_u32_path(root, "mega2", "sbhfOccupiedMask", &u32)) {
+                sbhf_occ_raw = u32;
+            }
+            g_state.sbhf_occupied_mask = (uint8_t)(sbhf_occ_raw & 0x07u);
+
             g_state.sbhf_restricted = json_get_bool_path3(root, "mega2", "sbhf", "restricted", g_state.sbhf_restricted);
             g_state.sbhf_start_pending = json_get_bool_path3(root, "mega2", "sbhf", "startPending", g_state.sbhf_start_pending);
 
@@ -1008,11 +1037,18 @@ static void hmi_state_update_from_json(const char *payload, uint32_t len)
         } else if (strcmp(type, "analog") == 0) {
             g_state.analog_frames++;
 
-            /* Analog frames carry vA10/vB10 as volts * 10.
-             * Display code converts back to one decimal place.
+            /* Analog frames from ETH are shaped like:
+             *   {"type":"analog", "analog": {"vA10":25,"vB10":24, ...}}
+             * Older/debug variants may carry vA10/vB10 at root level, so keep
+             * that as fallback. Values are volts * 10.
              */
-            g_state.trafo_oben_v10 = json_get_i32_root(root, "vA10", g_state.trafo_oben_v10);
-            g_state.trafo_unten_v10 = json_get_i32_root(root, "vB10", g_state.trafo_unten_v10);
+            const cJSON *analog = cJSON_GetObjectItemCaseSensitive(root, "analog");
+            g_state.trafo_oben_v10 = json_item_i32(
+                cJSON_GetObjectItemCaseSensitive(analog, "vA10"),
+                json_get_i32_root(root, "vA10", g_state.trafo_oben_v10));
+            g_state.trafo_unten_v10 = json_item_i32(
+                cJSON_GetObjectItemCaseSensitive(analog, "vB10"),
+                json_get_i32_root(root, "vB10", g_state.trafo_unten_v10));
 
             snprintf(g_state.last_analog_json, sizeof(g_state.last_analog_json), "%s", payload);
         } else {
@@ -1982,10 +2018,12 @@ static void uart_ui_timer_cb(lv_timer_t *timer)
     const bool power_on_enabled = can_operate && !s.power_on;
     const bool power_off_enabled = can_operate && s.power_on;
     const bool auto_enabled = can_operate;
+    const bool auto_reset_enabled = can_operate && s.auto_mode;
 
     ui_set_button_enabled(power_on_btn, power_on_enabled, 0x19B65A, 0xA8E6B8);
     ui_set_button_enabled(power_off_btn, power_off_enabled, 0xC83A32, 0xF3A09A);
     ui_set_button_enabled(auto_btn, auto_enabled, 0x00BCE3, 0x9DDDE8);
+    ui_set_button_enabled(auto_reset_btn, auto_reset_enabled, 0xF9D342, 0xDDC978);
 
     if (auto_btn) {
         lv_obj_t *auto_label = lv_obj_get_child(auto_btn, 0);
@@ -4187,9 +4225,13 @@ static void create_hmi_screen(void)
     lv_obj_add_event_cb(power_off_btn, on_power_off_clicked, LV_EVENT_CLICKED, NULL);
 
     auto_led = ui_make_led(right_panel, 12, 147);
-    auto_btn = ui_make_button(right_panel, "Auto", 34, 129, 236, 42, 0x00BCE3, 0xFFFFFF);
+    auto_btn = ui_make_button(right_panel, "Auto", 34, 129, 153, 42, 0x00BCE3, 0xFFFFFF);
     lv_obj_add_event_cb(auto_btn, left_click_flash_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(auto_btn, on_auto_clicked, LV_EVENT_CLICKED, NULL);
+
+    auto_reset_btn = ui_make_button(right_panel, "Reset", 193, 129, 77, 42, 0xF9D342, 0xFFFFFF);
+    lv_obj_add_event_cb(auto_reset_btn, left_click_flash_pressed_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(auto_reset_btn, on_auto_reset_clicked, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *trafo_card = lv_obj_create(right_panel);
     lv_obj_set_size(trafo_card, 276, 58);
